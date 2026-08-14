@@ -1,0 +1,119 @@
+# Podcast tactic config
+# Mirrors the constants from Section 1 of the Apps Script.
+
+tactic: podcast
+
+beeswax:
+  account_id: 2
+  bid_model_id: null
+  modifier_suffix: "Podcast IAN - API Test"
+  podcast_mod_prefix: "Podcast - Modifier ALL - "
+  pub_prefix: "Marketplace CTV - Pub:" # unused for podcast, kept for shared helpers
+  cat_prefix: "MP CTV Audience:"
+
+# AM-facing Sheet tab names (the slim 8-tab layout)
+sheet_tabs:
+  beeswax_line_item_settings: "Beeswax Line Item Settings"
+  sf_data_import: "SF Data Import"
+  up_pacing: "UP Pacing"
+  bid_optimizer: "Bid Optimizer"
+  pipeline_state: "Pipeline State"
+  run_log: "Run Log"
+  pause_log: "Pause Log"
+  reason_key: "Reason Key"
+  first_run_log: "Optimizer First Run Log"
+  second_run_log: "Optimizer Second Run Log"
+  paused_log: "SBO Paused Log"
+  paused_snapshot: "SBO Paused Multiplier Snapshot"
+  pacing_history: "SBO Pacing History"
+  kill_log: "Publisher Kill Log"
+
+# Multiplier engine — floor guardrails
+floor:
+  max_floor_mult: 1.20 # Day 1 baseline: floor × 1.20 / cpm_bid
+  norm_min_floor_mult: 1.10
+  throttle_mult: 1.05
+  kill_mult: 1.0
+
+# Multiplier engine — hard ceilings
+hard_max:
+  normal: 1.20
+  severe: 1.50
+  last3: 2.00 # backstop only; category dollar caps are the real ceiling
+
+cat_max_bid_eoc_bonus: 1.00 # +$1 EOC bonus to category cap when last-3-days underpacing
+
+# Fallback starting CPM for new terms with no clearing CPM or floor data
+new_term_fallback_dollar: 11.00
+
+# Single-day step caps
+max_single_day_down: 0.20
+
+# Modifier category routing
+modifier_priority:
+  - "iHM O&O"
+  - "Minimum Guarantees"
+
+modifier_throttle_levels:
+  "Triton IHM YOFAN": 1.10
+  "Triton YOFAN": 1.10
+  "Spreaker": 1.15
+
+modifier_other_name: "Other"
+
+# Category-level dollar caps (interpolated by pacing)
+# iHM O&O is excluded — held at 1.0× via floor rules.
+category_max_bid:
+  Minimum Guarantees:
+    max_at_over_100: 9.00
+    max_at_below_75: 12.50
+  Spreaker:
+    max_at_over_100: 11.00
+    max_at_below_75: 14.00
+  Triton IHM YOFAN:
+    max_at_over_100: 11.00
+    max_at_below_75: 14.00
+  Triton YOFAN:
+    max_at_over_100: 11.00
+    max_at_below_75: 14.00
+  Other:
+    max_at_over_100: 11.00
+    max_at_below_75: 14.00
+
+# Deal-level overrides (take precedence over category)
+deal_max_bid:
+  "tri/449776":
+    max_at_over_100: 3.00
+    max_at_below_75: 5.00
+    note: "AdTonos"
+  "tri/449999":
+    max_at_over_100: 5.00
+    max_at_below_75: 7.00
+    note: "RedCircle"
+
+# Continuous price tier modifiers (rank-based)
+price_tier:
+  down_min: 0.5 # cheapest pub when pacing down
+  down_max: 1.5 # most expensive pub when pacing down
+  up_norm_max: 1.3 # cheapest pub when pacing up (normal)
+  up_norm_min: 0.4
+  up_sev_max: 1.2
+  up_sev_min: 0.8
+
+# Floor diagnostic + fee adjustment (kept for parity with Apps Script)
+floor_spread_warn: 3.0
+floor_fee_mult: 1.07 # raw deal_agg floors are multiplied by this in the optimizer
+
+# Reporting / batch sizes
+api:
+  chunk_size: 40
+  report_batch_size: 25
+  atr_row_cap: 30000
+  max_input_rows: 8000
+
+# Run scheduling notes (informational — actual scheduling happens via cron / launchd)
+schedule_notes: |
+  Apps Script cadence (for reference):
+    - 12 AM ET: new lines only (Phase 3 — modifier sync for newly added LIs)
+    - 3  AM ET: full run (ATR → full report → pull modifiers → push)
+    - 9  PM ET: modifier resync (existing lines, ensure deals match terms)

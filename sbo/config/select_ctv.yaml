@@ -1,0 +1,135 @@
+# Select CTV tactic config
+# Mirrors the constants from Section 1 of the Select CTV Apps Script
+# (source: "select ctv sbo" — 2026-08-14 revision, the latest/authoritative one).
+#
+# Structural notes vs. Podcast/Streaming/MP CTV:
+#   - No content-category deal lists (cat_prefix unused, no category caps).
+#   - One floor per deal, not per publisher-list (bid_optimizer.py stores a
+#     single fee-adjusted Floor_Price, no separate max/min floor).
+#   - Bid-modifier terms target `deal_id` directly (not `deal_id_list`).
+#   - Uniform 40% publisher impression-share cap for every line (no 20%/537
+#     exception like MP CTV).
+#   - Pacing/end-date/goal source is the "Beeswax Select CTV" tab, not
+#     "SF Data Import" (see sheet_tabs.beeswax_select_ctv).
+
+tactic: select_ctv
+
+beeswax:
+  account_id: 2            # SBO_ACCOUNT_ID
+  bid_model_id: 5           # SBO_BID_MODEL_ID — sent on every new bid-modifier create
+  modifier_suffix: "API Test"       # SBO_MODIFIER_SUFFIX
+  podcast_mod_prefix: ""            # unused for Select CTV
+  pub_prefix: "Select CTV - "       # SBO_PUB_PREFIX
+  cat_prefix: ""                    # SBO_CAT_PREFIX — no category deal lists in Select CTV
+
+# AM-facing Sheet tab names
+sheet_tabs:
+  beeswax_line_item_settings: "Beeswax Line Item Settings"
+  sf_data_import: "SF Data Import"        # unused for Select CTV — Beeswax Select CTV is the real source
+  beeswax_select_ctv: "Beeswax Select CTV" # replaces sf_data_import: end date (col N) + goal (col R), header row 2
+  up_pacing: "UP Pacing"
+  bid_optimizer: "Bid Optimizer"
+  pipeline_state: "Pipeline State"
+  run_log: "SBO Run Log"
+  pause_log: "Pause Log"
+  reason_key: "Optimizer Reason Key"
+  first_run_log: "Optimizer First Run Log"
+  second_run_log: "Optimizer Second Run Log"
+  paused_log: "SBO Paused Log"
+  paused_snapshot: "SBO Paused Multiplier Snapshot"
+  pacing_history: "SBO Pacing History"
+  kill_log: "Publisher Kill Log"
+
+# Multiplier engine — floor guardrails
+# (OPT_NORM_MIN_FLOOR_MULT and OPT_THROTTLE_MULT updated 2026-08-14: 1.10→1.05, 1.05→1.00)
+floor:
+  max_floor_mult: 1.20        # OPT_MAX_FLOOR_MULT      — Day 1 baseline ceiling
+  norm_min_floor_mult: 1.05   # OPT_NORM_MIN_FLOOR_MULT — lowest normal ops (was 1.10 pre-8/14)
+  throttle_mult: 1.00         # OPT_THROTTLE_MULT       — soft throttle = exactly the fee-adj floor (was 1.05 pre-8/14)
+  kill_mult: 0.90             # OPT_KILL_MULT           — kill level (below all floors)
+
+# Multiplier engine — hard ceilings
+hard_max:
+  normal: 1.20    # OPT_HARD_MAX_MULT   — normal-tier ceiling
+  severe: 1.50    # OPT_HARD_MAX_SEVERE — severe underpacing (<75%), outside last 3 days
+  last3: 2.00     # OPT_HARD_MAX_LAST3  — absolute outer ceiling (last-3-days branch + universal final clamp)
+
+# Not used for Select CTV (no category dollar caps); kept for model compatibility
+cat_max_bid_eoc_bonus: 0.00
+
+# Phase 3 (add missing deal terms) fallback starting multiplier when no floor
+# is known for a deal: literal $45 / cpm_bid — hardcoded in the Apps Script,
+# not derived from any other named constant. Not used by Phase 1 (see below).
+new_term_fallback_dollar: 45.00
+
+# Single-day step cap for downward moves
+max_single_day_down: 0.20     # OPT_MAX_SINGLE_DAY_DOWN
+
+# Select CTV does not use modifier_priority / modifier_other / category caps
+# (those are Podcast/Streaming concepts — Select CTV has no category layer)
+modifier_priority: []
+modifier_throttle_levels: {}
+modifier_other_name: ""
+category_max_bid: {}
+deal_max_bid: {}
+
+# Continuous price tier modifiers (identical constants to Podcast/Streaming/MP CTV)
+price_tier:
+  down_min: 0.5     # OPT_TIER_DOWN_MIN    — cheapest pub modifier when overpacing
+  down_max: 1.5     # OPT_TIER_DOWN_MAX    — most expensive pub modifier when overpacing
+  up_norm_max: 1.3  # OPT_TIER_UP_NORM_MAX — cheapest pub when underpacing (normal)
+  up_norm_min: 0.4  # OPT_TIER_UP_NORM_MIN
+  up_sev_max: 1.2   # OPT_TIER_UP_SEV_MAX  — cheapest pub when underpacing (severe)
+  up_sev_min: 0.8   # OPT_TIER_UP_SEV_MIN
+
+# Publisher impression share cap — uniform for ALL lines in Select CTV
+# (no 20%/537 exception like MP CTV; OPT_PUB_CAP_OTHER comment: "ALL lines")
+pub_cap_other: 0.40
+
+# Not used for Select CTV — no category layer, no marketplace-list kill/throttle scope
+cat_cap_over: 0.00
+cat_cap_under: 0.00
+cat_kill_over: 0.00
+marketplace_list_ids: []
+deal_537_id: "537"
+
+# On-target (100-105% pacing, >7 days remaining) margin-health trim — added
+# 2026-08-14. Uses Deal_Clearing_CPM_On_LI (falls back to Last_3_Days_Clearing_CPM
+# if unavailable) vs. CPM bid. Trims slowly even while pacing looks fine, to
+# improve clearing efficiency. Does NOT apply in the <=7-day dampened window
+# or to any other pacing branch.
+margin_trim:
+  healthy_margin_threshold: 0.06   # margin >= 6% → healthy, slow trim
+  healthy_step: 0.025              # step down when margin is healthy (>=6%)
+  thin_step: 0.05                  # step down when margin is thin (<6%)
+
+# DSP fee multiplier applied to raw floor prices. floor_spread_warn is
+# effectively inert for Select CTV (Max_Floor == Min_Floor by construction,
+# since floors are per-deal not per-publisher-list) but kept for model parity.
+floor_spread_warn: 3.0
+floor_fee_mult: 1.07  # OPT_FLOOR_FEE_MULT
+
+# Reporting / batch sizes
+api:
+  chunk_size: 40
+  report_batch_size: 25
+  atr_row_cap: 30000
+  max_input_rows: 8000
+
+schedule_notes: |
+  Select CTV Apps Script daily cadence (for reference — source of truth for
+  the DECISION LOGIC is the 2026-08-14 Apps Script):
+    - 11:30 UTC : runATRBatchRebuild (checkpointed, self-resuming via 30s
+                  trigger) → on completion, directly chains into:
+                  buildFullReport → pullBidModifiers → buildOptimizerSheet
+                  → calculatePacingFromBW → calculateNewMultipliers
+                  → pushMultipliersToBeeswax
+  In the Apps Script, Phase 1 / Phase 2 / Phase 3 (create / patch / sync
+  bid-modifier terms) are manual-only (onboarding new lines / periodic
+  re-sync), not part of the automated daily chain.
+
+  This Python port deliberately runs Phase 3 automatically every day ahead
+  of the Full Run, matching Marketplace CTV's droplet cron pattern rather
+  than the Apps Script's manual-only cadence — see run_select_ctv_daily.sh
+  (phase3 → full → pushonly, no human review gate). Phase 1 and Phase 2
+  remain manual/onboarding-only steps, same as MP CTV.

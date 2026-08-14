@@ -1,0 +1,118 @@
+# Marketplace CTV tactic config
+# Mirrors the constants from Section 1 of the MP CTV Apps Script.
+
+tactic: marketplace_ctv
+
+beeswax:
+  account_id: 2
+  bid_model_id: null
+  modifier_suffix: "MP CTV Optimizer"
+  podcast_mod_prefix: ""          # unused for MP CTV
+  pub_prefix: "Marketplace CTV - Pub:"
+  cat_prefix: "MP CTV Audience:"
+
+# AM-facing Sheet tab names
+sheet_tabs:
+  beeswax_line_item_settings: "Beeswax Line Item Settings"
+  sf_data_import: "SF Data Import"
+  up_pacing: "UP Pacing"
+  bid_optimizer: "Bid Optimizer"
+  pipeline_state: "Pipeline State"
+  run_log: "Run Log"
+  pause_log: "Pause Log"
+  reason_key: "Reason Key"
+  first_run_log: "Optimizer First Run Log"
+  second_run_log: "Optimizer Second Run Log"
+  paused_log: "SBO Paused Log"
+  paused_snapshot: "SBO Paused Multiplier Snapshot"
+  pacing_history: "SBO Pacing History"
+  kill_log: "Publisher Kill Log"
+  deal_cpm_history: "Deal CPM History"
+  publisher_cpm_history: "Publisher CPM History"
+
+# Multiplier engine — floor guardrails (MP CTV constants from Apps Script Section 1)
+floor:
+  max_floor_mult: 1.30        # OPT_MAX_FLOOR_MULT      — Day 1 baseline
+  norm_min_floor_mult: 1.10   # OPT_NORM_MIN_FLOOR_MULT — lowest normal ops
+  throttle_mult: 1.03         # OPT_THROTTLE_MULT       — soft throttle level
+  kill_mult: 0.75             # OPT_KILL_MULT           — price kill level
+
+# Multiplier engine — hard ceilings
+hard_max:
+  normal: 1.00    # OPT_NORMAL_MAX_MULT — ceiling during normal operations
+  severe: 1.50    # OPT_HARD_MAX_MULT   — absolute ceiling (severe underpace / EOC)
+  last3: 1.50     # same as severe — last-3-days underpace raises to hard max
+
+# Not used for MP CTV (no category dollar caps); kept for model compatibility
+cat_max_bid_eoc_bonus: 0.00
+
+# Fallback starting CPM for new terms with no clearing CPM or floor data
+# Maps to the $20 fallback in MP CTV Phase 3
+new_term_fallback_dollar: 20.00
+
+# Single-day step cap for downward moves
+max_single_day_down: 0.20     # OPT_MAX_SINGLE_DAY_DOWN
+
+# MP CTV does not use modifier_priority / modifier_other / category caps
+# (those are Podcast/Streaming concepts — MP CTV uses pub/category share caps instead)
+modifier_priority: []
+modifier_throttle_levels: {}
+modifier_other_name: ""
+category_max_bid: {}
+deal_max_bid: {}
+
+# Continuous price tier modifiers (identical constants to Podcast/Streaming)
+price_tier:
+  down_min: 0.5     # OPT_TIER_DOWN_MIN  — cheapest pub modifier when overpacing
+  down_max: 1.5     # OPT_TIER_DOWN_MAX  — most expensive pub modifier when overpacing
+  up_norm_max: 1.3  # OPT_TIER_UP_NORM_MAX — cheapest pub when underpacing (normal)
+  up_norm_min: 0.4  # OPT_TIER_UP_NORM_MIN
+  up_sev_max: 1.2   # OPT_TIER_UP_SEV_MAX  — cheapest pub when underpacing (severe)
+  up_sev_min: 0.8   # OPT_TIER_UP_SEV_MIN
+
+# Publisher impression share caps
+pub_cap_537: 0.20    # OPT_PUB_CAP_537   — cap for 537-targeted lines
+pub_cap_other: 0.40  # OPT_PUB_CAP_OTHER — cap for all other lines
+
+# Category impression share caps (537-targeted lines only)
+cat_cap_over: 0.25   # OPT_CAT_CAP_OVER  — throttle entry when overpacing
+cat_cap_under: 0.30  # OPT_CAT_CAP_UNDER — throttle entry when underpacing
+cat_kill_over: 0.30  # OPT_CAT_KILL_OVER — kill threshold (3/4 or 4/4 good history, overpacing)
+
+# Marketplace deal list IDs — kill/throttle rules only apply when at least one is targeted
+marketplace_list_ids:
+  - "12"
+  - "13"
+  - "14"
+  - "15"
+  - "73"
+  - "74"
+  - "78"
+  - "79"
+  - "80"
+  - "81"
+  - "106"
+  - "120"
+  - "121"
+  - "138"
+  - "525"
+  - "537"
+
+# Deal list ID that triggers 537-specific caps
+deal_537_id: "537"
+
+# DSP fee multiplier applied to raw floor prices
+floor_spread_warn: 3.0
+floor_fee_mult: 1.07  # OPT_FLOOR_FEE_MULT
+
+# Reporting / batch sizes
+api:
+  chunk_size: 40
+  report_batch_size: 25
+  atr_row_cap: 30000
+  max_input_rows: 8000
+
+schedule_notes: |
+  MP CTV Apps Script cadence (for reference):
+    - 1:00 AM ET : Phase 3 — updateBidModifierTerms
+    - 5:30 AM ET : Push multipliers

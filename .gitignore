@@ -1,0 +1,29 @@
+# Secrets — never commit
+.env
+credentials/*.json
+credentials/token.json
+credentials/oauth_client.json
+
+# Local Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+*.pyo
+
+# Runtime data — regenerated per run/environment, not source
+runs/
+state/
+logs/
+dashboards/*.csv.gz
+
+# Editor / OS cruft
+.DS_Store
+*.bak
+*.bak.*
+*.save
+*.save.*
+
+# Test / lint caches
+.pytest_cache/
+.ruff_cache/
