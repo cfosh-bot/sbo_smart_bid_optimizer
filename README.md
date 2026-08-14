@@ -15,6 +15,7 @@ no 30-min walls, no trigger chaining.
 |----------|----------|
 | **[SHARING.md](SHARING.md)** | First-time setup — give this to every new user |
 | **[HOW_TO_USE.md](HOW_TO_USE.md)** | Day-to-day operator guide — what the buttons do |
+| **[ONBOARDING.md](ONBOARDING.md)** | Team git workflow — clone/setup, staying in sync, resolving version-mismatch blocks |
 
 ---
 
