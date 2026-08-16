@@ -323,11 +323,12 @@ def _decide_one_mp_ctv(
     #   1. real floor                       → ctx.floor
     #   2. l3_cpm * 1.25                     → Situation A, has some LI history
     #   3. deal_cpm_li * 1.25                → Situation A, has some LI history
-    #   4. pub_glob_cpm * 1.2                → Situation B, publisher has data
+    #   4. pub_glob_cpm (raw)                → Situation B, publisher has data
     #   5. new_term_fallback_dollar ($20)    → Situation B, nothing at all
-    # Tiers 4-5 are direct BID targets (not a floor to re-multiply by
-    # day1_floor_mult/day2_floor_mult) — floor_tier tells Day 1/Day 2 which
-    # case they're in so they don't double-apply their own multiplier.
+    # Tiers 4-5 feed norm_min/throttle_mult/kill_mult below as a floor ESTIMATE
+    # only. Day 1/Day 2 apply their OWN multiplier on top of the raw value
+    # (pub_glob_cpm × 1.2, or the flat $20 as-is) — see floor_tier below, which
+    # tells Day 1/Day 2 which case they're in so they don't double-multiply.
     effective_floor = ctx.floor
     floor_tier = "real"
     if effective_floor <= 0:
@@ -346,6 +347,11 @@ def _decide_one_mp_ctv(
 
     # ── Pre-compute thresholds ────────────────────────────────────────────
     # Use effective_floor (falls back to deal_cpm*1.25 when floor is missing)
+    # Safety clamp: none of these floors/throttle levels should ever exceed
+    # hard_max.normal — that inverted state can otherwise happen when
+    # effective_floor is a rough estimate (Situation A/B tiers) and CPM_Bid on
+    # the line is set low relative to it, which would make every downstream
+    # decision get dragged up above the intended ceiling for that deal.
     norm_min        = min(max((effective_floor * f.norm_min_floor_mult) / ctx.cpm_bid, 0.01), cfg.hard_max.normal)
     throttle_mult   = min((effective_floor * f.throttle_mult) / ctx.cpm_bid, cfg.hard_max.normal)
     kill_mult       = min((effective_floor * f.kill_mult) / ctx.cpm_bid, cfg.hard_max.normal)
@@ -429,9 +435,11 @@ def _decide_one_mp_ctv(
             # (a specific *new deal* added mid-campaign — see smart_starting_mult
             # in phases.py), not to the daily Day 1/Day 2 cascade.
             if floor_tier == "pub_bid":
+                # Situation B — no floor/history, publisher has clearing data.
                 raw_d1   = (ctx.pub_glob_cpm * 1.2) / ctx.cpm_bid
                 d1_label = f"pub global clearing CPM ${ctx.pub_glob_cpm:.2f} × 1.2 (no floor, no delivery yet)"
             elif floor_tier == "flat_bid":
+                # Situation B — nothing at all: floor, history, and publisher data all missing.
                 raw_d1   = cfg.new_term_fallback_dollar / ctx.cpm_bid
                 d1_label = f"${cfg.new_term_fallback_dollar:.2f} flat fallback (no floor, no delivery, no publisher data)"
             else:
@@ -813,13 +821,15 @@ def _normal_pacing_mp_ctv(
     pacing = ctx.pacing or 0.0
     median_cpm = 0.0  # passed in context not available here; reason text will omit it
 
-    if pacing >= 1.0:
-        # ── Overpacing ────────────────────────────────────────────────
-        if pacing < 1.05:
-            return ctx.curr_mult, "PACE_HOLD_ONTARGET", (
-                f"Pacing {round(pacing * 100)}% (100–105%) — on target, no adjustment."
-            )
+    # 2026-08-16: hold band widened from 100-105% to 95-105% per pacing review —
+    # slightly-under-target lines (95-99%) no longer get an unnecessary raise.
+    if 0.95 <= pacing < 1.05:
+        return ctx.curr_mult, "PACE_HOLD_ONTARGET", (
+            f"Pacing {round(pacing * 100)}% (95–105%) — on target, no adjustment."
+        )
 
+    if pacing >= 1.05:
+        # ── Overpacing ────────────────────────────────────────────────
         base_down  = 0.10 if pacing < 1.15 else (0.15 if pacing < 1.25 else 0.20)
         base_down *= hist_trend
         tier_down  = _price_tier_mod(ctx.rank_frac, "down", cfg)
@@ -888,7 +898,22 @@ def _normal_pacing_mp_ctv(
     this_kill = round((ctx.floor * cfg.floor.kill_mult) / ctx.cpm_bid, 3)
     is_below_l3_p5 = (ctx.l3_cpm > 0 and ctx.deal_cpm_li > 0
                       and ctx.deal_cpm_li <= ctx.l3_cpm * 1.2)
-    if ctx.curr_mult <= this_kill * 1.05 and pk_map.get(pk_key) is None and not is_below_l3_p5:
+    # 2026-08-16: second force-unkill fallback, specifically for a deal with
+    # ZERO impressions on this LI (deal_cpm_li == 0) — is_below_l3_p5 above can
+    # never fire for it, since there's no clearing CPM to compare. Falls back to
+    # comparing the deal's FLOOR price to L3 instead: if the floor is cheap
+    # enough relative to what the line is already clearing, let it try again
+    # rather than freezing it at kill level forever with no way to re-test.
+    is_floor_below_l3_p5 = (
+        ctx.deal_cpm_li == 0 and ctx.l3_cpm > 0 and ctx.floor > 0
+        and ctx.floor <= ctx.l3_cpm * 1.2
+    )
+    if (
+        ctx.curr_mult <= this_kill * 1.05
+        and pk_map.get(pk_key) is None
+        and not is_below_l3_p5
+        and not is_floor_below_l3_p5
+    ):
         return ctx.curr_mult, "PRICE_KILL_HOLD", (
             f"PRICE_KILL_HOLD — deal at kill level ({ctx.curr_mult:.3f}). "
             f"No staging unkill entry. Holding."
