@@ -70,14 +70,20 @@ def smart_starting_mult(
     deal_glob_cpm: float,
     deal_floor: float,
     fallback_dollar: float,
+    floor_mult: float = 1.30,
 ) -> tuple[float, str]:
     """Return (multiplier, source_explanation).
 
     Pricing priority:
         floor ≤ $0.01 → 1.00× (O&O fixed price)
         globCpm > 0   → (globCpm × 1.2) / cpm_bid
-        floor > 0     → (floor × 1.3) / cpm_bid
-        fallback      → $11 / cpm_bid
+        floor > 0     → (floor × floor_mult) / cpm_bid
+        fallback      → $ fallback_dollar / cpm_bid
+
+    `floor_mult` defaults to 1.30 (Podcast/Streaming/Total Audio, unchanged).
+    Marketplace CTV passes cfg.floor.new_term_floor_mult (1.25 as of the
+    2026-08-16 review) — this is the ONLY thing that differs per product;
+    Podcast/Streaming call sites don't pass floor_mult and get the old value.
     """
     if deal_floor and deal_floor <= 0.01:
         return 1.00, "floor $0.01 → 1.000×"
@@ -86,8 +92,8 @@ def smart_starting_mult(
             f"globCPM ${deal_glob_cpm:.2f} × 1.2"
         )
     if deal_floor > 0 and cpm_bid > 0:
-        return round(max(0.01, (deal_floor * 1.3) / cpm_bid), 2), (
-            f"floor ${deal_floor:.2f} × 1.3"
+        return round(max(0.01, (deal_floor * floor_mult) / cpm_bid), 2), (
+            f"floor ${deal_floor:.2f} × {floor_mult}"
         )
     if cpm_bid > 0:
         return round(fallback_dollar / cpm_bid, 2), f"${fallback_dollar} fallback"
@@ -290,6 +296,7 @@ def create_publisher_bid_modifiers(
                     deal_glob_cpm=pricing.glob_cpm.get(d, 0),
                     deal_floor=pricing.floor.get(d, 0),
                     fallback_dollar=_resolve_fallback_dollar(cfg, d, pricing),
+                    floor_mult=cfg.floor.new_term_floor_mult,
                 )
                 terms.append({
                     "comparator": "equals",
@@ -557,6 +564,7 @@ def update_bid_modifier_terms(
                     deal_glob_cpm=pricing.glob_cpm.get(d, 0),
                     deal_floor=pricing.floor.get(d, 0),
                     fallback_dollar=_resolve_fallback_dollar(cfg, d, pricing),
+                    floor_mult=cfg.floor.new_term_floor_mult,
                 )
                 mod_obj["terms"].append({
                     "comparator": "equals",

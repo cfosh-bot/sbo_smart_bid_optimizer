@@ -30,12 +30,21 @@ sheet_tabs:
   deal_cpm_history: "Deal CPM History"
   publisher_cpm_history: "Publisher CPM History"
 
-# Multiplier engine — floor guardrails (MP CTV constants from Apps Script Section 1)
+# Multiplier engine — floor guardrails
+# Updated 2026-08-16 per pacing-rules review (see conversation w/ Casey):
+#   - Day 1 / Day 2 redesigned to be purely floor-based (no more global/deal
+#     clearing CPM dependency for the LI-level daily bootstrap).
+#   - norm_min_floor_mult lowered from 1.10 to 1.015 — this is now THE regular
+#     operating floor for any deal that isn't publisher-killed, category-killed,
+#     or price-killed. Below floor is reserved exclusively for kill states.
 floor:
-  max_floor_mult: 1.30        # OPT_MAX_FLOOR_MULT      — Day 1 baseline
-  norm_min_floor_mult: 1.10   # OPT_NORM_MIN_FLOOR_MULT — lowest normal ops
-  throttle_mult: 1.03         # OPT_THROTTLE_MULT       — soft throttle level
-  kill_mult: 0.75             # OPT_KILL_MULT           — price kill level
+  max_floor_mult: 1.30        # OPT_MAX_FLOOR_MULT      — PRE_FLIGHT_HOLD only (unchanged)
+  norm_min_floor_mult: 1.015  # OPT_NORM_MIN_FLOOR_MULT — regular non-killed floor (was 1.10)
+  throttle_mult: 1.03         # OPT_THROTTLE_MULT       — top of the cap/cat-cap throttle glide range
+  kill_mult: 0.75             # OPT_KILL_MULT           — PRICE_KILL / PRICE_KILL_HOLD level only (unchanged)
+  day1_floor_mult: 1.25       # NEW — Day 1 baseline: floor × 1.25 (was global CPM × 1.3)
+  day2_floor_mult: 1.15       # NEW — Day 2 baseline: floor × 1.15 (was deal CPM × 1.1, bug; host said 1.2)
+  new_term_floor_mult: 1.25   # NEW — Phase 1 / Phase 3 new-deal-term fallback (was 1.30)
 
 # Multiplier engine — hard ceilings
 hard_max:
@@ -46,8 +55,9 @@ hard_max:
 # Not used for MP CTV (no category dollar caps); kept for model compatibility
 cat_max_bid_eoc_bonus: 0.00
 
-# Fallback starting CPM for new terms with no clearing CPM or floor data
-# Maps to the $20 fallback in MP CTV Phase 3
+# Standard $20 fallback bid — used when there's no floor, no delivery history,
+# AND no publisher clearing data at all. Shared by Phase 1 / Phase 3 (new deal
+# terms) and now also Day 1 / Day 2 (brand-new line, nothing to anchor to yet).
 new_term_fallback_dollar: 20.00
 
 # Single-day step cap for downward moves

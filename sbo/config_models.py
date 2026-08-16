@@ -48,6 +48,19 @@ class FloorBlock(BaseModel):
     throttle_mult: float
     kill_mult: float
 
+    # ── MP CTV-only Day 1 / Day 2 baseline multipliers (2026-08-16 redesign) ──
+    # Optional so Podcast/Streaming/Total Audio/Select CTV YAMLs (which don't
+    # set these) stay valid and keep using their own existing Day 1/2 logic.
+    day1_floor_mult: Optional[float] = None
+    day2_floor_mult: Optional[float] = None
+
+    # Floor multiplier used ONLY by Phase 1 / Phase 3 (smart_starting_mult) when
+    # bootstrapping a brand-new deal term. Deliberately separate from
+    # max_floor_mult (which PRE_FLIGHT_HOLD still uses) so this can change per
+    # product without touching PRE_FLIGHT_HOLD. Defaults to 1.30 to preserve
+    # current behavior for every product that doesn't override it.
+    new_term_floor_mult: float = 1.30
+
 
 class HardMaxBlock(BaseModel):
     normal: float

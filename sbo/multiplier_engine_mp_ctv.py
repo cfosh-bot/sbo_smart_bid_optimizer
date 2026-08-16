@@ -145,6 +145,7 @@ class _MCTVRowContext:
     floor: float
     deal_cpm_li: float
     deal_glob_cpm: float
+    pub_glob_cpm: float
     l3_cpm: float
     pub_share: float        # Pub_Impression_Share_Pct (0–100)
     pub_name: str
@@ -196,6 +197,7 @@ class _MCTVRowContext:
             floor=_safe_float(row.get("Floor_Price")),
             deal_cpm_li=_safe_float(row.get("Deal_Clearing_CPM_On_LI")),
             deal_glob_cpm=_safe_float(row.get("Deal_Global_Clearing_CPM")),
+            pub_glob_cpm=_safe_float(row.get("Pub_Global_Clearing_CPM")),
             l3_cpm=_safe_float(row.get("Last_3_Days_Clearing_CPM")),
             pub_share=_safe_float(row.get("Pub_Impression_Share_Pct")),
             pub_name=str(row.get("Publisher", "") or ""),
@@ -314,26 +316,40 @@ def _decide_one_mp_ctv(
         _append(result, ctx, 0.0, "NO_CPM_BID", "No CPM bid data — skipping.")
         return
 
-    # Missing floor: use l3_cpm * 1.25 as effective floor.
-    # If l3_cpm is also missing, fall back to deal_cpm_li * 1.25.
-    # This ensures the engine never bids $0 just because floor data is absent.
+    # Missing floor: cascading fallback so the engine never bids near-zero or
+    # skips entirely just because floor data is absent. Tiers 1-2 (Situation A)
+    # are unchanged from before. Tiers 3-4 (Situation B, added 2026-08-16) cover
+    # a genuinely brand-new deal with no floor AND no delivery history yet:
+    #   1. real floor                       → ctx.floor
+    #   2. l3_cpm * 1.25                     → Situation A, has some LI history
+    #   3. deal_cpm_li * 1.25                → Situation A, has some LI history
+    #   4. pub_glob_cpm * 1.2                → Situation B, publisher has data
+    #   5. new_term_fallback_dollar ($20)    → Situation B, nothing at all
+    # Tiers 4-5 are direct BID targets (not a floor to re-multiply by
+    # day1_floor_mult/day2_floor_mult) — floor_tier tells Day 1/Day 2 which
+    # case they're in so they don't double-apply their own multiplier.
     effective_floor = ctx.floor
+    floor_tier = "real"
     if effective_floor <= 0:
         if ctx.l3_cpm > 0:
             effective_floor = round(ctx.l3_cpm * 1.25, 2)
+            floor_tier = "l3_est"
         elif ctx.deal_cpm_li > 0:
             effective_floor = round(ctx.deal_cpm_li * 1.25, 2)
+            floor_tier = "dealcpm_est"
+        elif ctx.pub_glob_cpm > 0:
+            effective_floor = round(ctx.pub_glob_cpm, 2)
+            floor_tier = "pub_bid"
         else:
-            _append(result, ctx, 0.0, "NO_FLOOR",
-                    "No floor or deal CPM data — skipping.")
-            return
+            effective_floor = round(cfg.new_term_fallback_dollar, 2)
+            floor_tier = "flat_bid"
 
     # ── Pre-compute thresholds ────────────────────────────────────────────
     # Use effective_floor (falls back to deal_cpm*1.25 when floor is missing)
-    norm_min        = max((effective_floor * f.norm_min_floor_mult) / ctx.cpm_bid, 0.01)
-    throttle_mult   = (effective_floor * f.throttle_mult) / ctx.cpm_bid
-    kill_mult       = (effective_floor * f.kill_mult) / ctx.cpm_bid
-    cap_kill_mult   = (effective_floor * 0.10) / ctx.cpm_bid  # publisher/category hard kill
+    norm_min        = min(max((effective_floor * f.norm_min_floor_mult) / ctx.cpm_bid, 0.01), cfg.hard_max.normal)
+    throttle_mult   = min((effective_floor * f.throttle_mult) / ctx.cpm_bid, cfg.hard_max.normal)
+    kill_mult       = min((effective_floor * f.kill_mult) / ctx.cpm_bid, cfg.hard_max.normal)
+    cap_kill_mult   = min((effective_floor * 0.10) / ctx.cpm_bid, cfg.hard_max.normal)  # publisher/category hard kill
 
     # Dynamic max multiplier for this deal (based on deal CPM history)
     dyn_cpm_ceil  = max(ctx.deal_cpm_li, ctx.deal_glob_cpm)
@@ -407,9 +423,22 @@ def _decide_one_mp_ctv(
                 seen_second.add(ctx.bw_id)
                 result.new_second_run.append((ctx.bw_id, ctx.end_date))
         else:
-            d1_src_cpm  = ctx.deal_glob_cpm if ctx.deal_glob_cpm > 0 else ctx.floor
-            d1_label    = ("deal global CPM" if ctx.deal_glob_cpm > 0 else "floor") + f" ${d1_src_cpm:.2f} × 1.3"
-            raw_d1      = (d1_src_cpm * f.max_floor_mult) / ctx.cpm_bid
+            # 2026-08-16: Day 1 is now purely floor-based — floor × day1_floor_mult
+            # (1.25). Global/deal clearing CPM is no longer used for the LI-level
+            # Day 1 bootstrap; that CPM-based formula now belongs only to Phase 3
+            # (a specific *new deal* added mid-campaign — see smart_starting_mult
+            # in phases.py), not to the daily Day 1/Day 2 cascade.
+            if floor_tier == "pub_bid":
+                raw_d1   = (ctx.pub_glob_cpm * 1.2) / ctx.cpm_bid
+                d1_label = f"pub global clearing CPM ${ctx.pub_glob_cpm:.2f} × 1.2 (no floor, no delivery yet)"
+            elif floor_tier == "flat_bid":
+                raw_d1   = cfg.new_term_fallback_dollar / ctx.cpm_bid
+                d1_label = f"${cfg.new_term_fallback_dollar:.2f} flat fallback (no floor, no delivery, no publisher data)"
+            else:
+                raw_d1   = (effective_floor * f.day1_floor_mult) / ctx.cpm_bid
+                d1_label = f"floor ${effective_floor:.2f} × {f.day1_floor_mult}" + (
+                    " (estimated — no published floor yet)" if floor_tier != "real" else ""
+                )
             new_mult    = round(min(cfg.hard_max.normal, max(0.01, raw_d1)), 3)
             reason_code = "FIRST_RUN"
             reason_text = (
@@ -423,31 +452,26 @@ def _decide_one_mp_ctv(
     # PRIORITY B — Day 2
     # ══════════════════════════════════════════════════════════════════
     elif ctx.bw_id not in second_run_seen and (ctx.days_rem is None or ctx.days_rem > 3):
-        # Source CPM: deal_cpm_li first, then deal_glob_cpm, then floor fallback.
-        # deal_cpm_li can be 0 even when the column is populated if the deal had
-        # no impressions yesterday (spend/imps = 0 in the ATR aggregation).
-        d2_cpm   = ctx.deal_cpm_li if ctx.deal_cpm_li > 0 else ctx.deal_glob_cpm
-        if d2_cpm > 0:
-            raw_d2   = (d2_cpm * 1.1) / ctx.cpm_bid
-            new_mult = round(min(cfg.hard_max.normal, max(0.01, raw_d2)), 3)
-            reason_code = "DAY2_BASELINE"
-            src_label = (
-                f"deal CPM on LI ${ctx.deal_cpm_li:.2f}"
-                if ctx.deal_cpm_li > 0
-                else f"deal global CPM ${ctx.deal_glob_cpm:.2f} (LI CPM=0 fallback)"
-            )
-            reason_text = (
-                f"Day 2 — {src_label} × 1.1 / "
-                f"CPM bid ${ctx.cpm_bid:.2f} = {new_mult}×."
-            )
+        # 2026-08-16: Day 2 is now purely floor-based — floor × day2_floor_mult
+        # (1.15). Deal/LI clearing CPM is no longer used here (previously this
+        # branch read deal_cpm_li/deal_glob_cpm, and had a bug using 1.1 instead
+        # of the host script's 1.2 — both are moot now that Day 2 is floor-based).
+        if floor_tier == "pub_bid":
+            raw_d2   = (ctx.pub_glob_cpm * 1.2) / ctx.cpm_bid
+            d2_label = f"pub global clearing CPM ${ctx.pub_glob_cpm:.2f} × 1.2 (no floor, no delivery yet)"
+        elif floor_tier == "flat_bid":
+            raw_d2   = cfg.new_term_fallback_dollar / ctx.cpm_bid
+            d2_label = f"${cfg.new_term_fallback_dollar:.2f} flat fallback (no floor, no delivery, no publisher data)"
         else:
-            raw_d2fb = (effective_floor * f.max_floor_mult) / ctx.cpm_bid
-            new_mult = round(min(cfg.hard_max.normal, max(0.01, raw_d2fb)), 3)
-            reason_code = "DAY2_BASELINE_FALLBACK"
-            reason_text = (
-                f"Day 2 (no deal CPM) — floor ${effective_floor:.2f} × 1.3 / "
-                f"CPM bid ${ctx.cpm_bid:.2f} = {new_mult}×."
+            raw_d2   = (effective_floor * f.day2_floor_mult) / ctx.cpm_bid
+            d2_label = f"floor ${effective_floor:.2f} × {f.day2_floor_mult}" + (
+                " (estimated — no published floor yet)" if floor_tier != "real" else ""
             )
+        new_mult    = round(min(cfg.hard_max.normal, max(0.01, raw_d2)), 3)
+        reason_code = "DAY2_BASELINE"
+        reason_text = (
+            f"Day 2 baseline — {d2_label} / CPM bid ${ctx.cpm_bid:.2f} = {new_mult}×."
+        )
         if ctx.bw_id not in seen_second:
             seen_second.add(ctx.bw_id)
             result.new_second_run.append((ctx.bw_id, ctx.end_date))
@@ -586,22 +610,25 @@ def _decide_one_mp_ctv(
         and not cat_kill_eligible
     ):
         cap_prog = (pub_frac - pub_cap * 0.8) / (pub_cap * 0.2)
-        if ctx.curr_mult <= throttle_mult:
+        # 2026-08-16: gliding target — starts at throttle_mult (1.03×) as soon as
+        # the deal enters throttle range, slides down to norm_min (1.015×) as
+        # cap_prog approaches 1.0 (right at the kill threshold). Previously this
+        # tapered toward a fixed 1.03× target; now the target itself moves.
+        cap_target = throttle_mult - cap_prog * (throttle_mult - norm_min)
+        if ctx.curr_mult <= cap_target:
             new_mult    = ctx.curr_mult
             reason_code = "CAP_THROTTLE_HOLD"
             reason_text = (
                 f"Approaching pub cap ({ctx.pub_share:.1f}% of {pub_cap * 100:.0f}%) "
-                f"— at/below throttle level, holding {ctx.curr_mult:.3f}×."
+                f"— at/below the glide target ({cap_target:.3f}×), holding {ctx.curr_mult:.3f}×."
             )
         else:
-            new_mult = round(max(
-                throttle_mult,
-                ctx.curr_mult - (ctx.curr_mult - throttle_mult) * cap_prog,
-            ), 3)
+            new_mult = round(cap_target, 3)
             reason_code = "CAP_THROTTLE"
             reason_text = (
                 f"Approaching pub cap ({ctx.pub_share:.1f}% of {pub_cap * 100:.0f}%) "
                 f"— soft throttle. Progress: {cap_prog * 100:.0f}%. "
+                f"Glide target {throttle_mult:.3f}× → {norm_min:.3f}× at cap: "
                 f"{ctx.curr_mult:.3f} → {new_mult:.3f}×."
             )
 
@@ -650,6 +677,13 @@ def _decide_one_mp_ctv(
             )
         elif cat_frac >= throttle_entry:
             cat_prog = min(1.0, (cat_frac - throttle_entry) / (cat_threshold - throttle_entry))
+            # 2026-08-16: same gliding target as publisher throttle — starts at
+            # throttle_mult (1.03×), slides down to norm_min (1.015×) as cat_prog
+            # approaches the kill threshold. The old 0.7 damping factor (which
+            # kept category throttle gentler than publisher throttle) is removed —
+            # category and publisher throttle now behave identically, kill
+            # eligibility is what makes category cap the stricter of the two.
+            cat_target = throttle_mult - cat_prog * (throttle_mult - norm_min)
             # If overpacing and deal is at/below kill level — hold at kill level.
             # Cat cap throttle must never RAISE a killed deal when overpacing.
             if (ctx.pacing is None or ctx.pacing >= 1.0) and ctx.curr_mult <= kill_mult * 1.05:
@@ -660,30 +694,22 @@ def _decide_one_mp_ctv(
                     f"overpacing {round(ctx.pacing*100) if ctx.pacing else '?'}%. "
                     f"Cat cap ({ctx.cat_share:.1f}%) does not raise killed deals."
                 )
-            elif ctx.curr_mult <= norm_min:
-                new_mult    = norm_min
-                reason_code = "CAT_CAP_THROTTLE_HOLD"
-                reason_text = (
-                    f"Category approaching {cat_threshold * 100:.0f}% cap "
-                    f"({ctx.cat_share:.1f}%) — at norm_min floor, holding {norm_min:.3f}×."
-                )
-            elif ctx.curr_mult <= throttle_mult:
+            elif ctx.curr_mult <= cat_target:
                 new_mult    = ctx.curr_mult
                 reason_code = "CAT_CAP_THROTTLE_HOLD"
                 reason_text = (
                     f"Category approaching {cat_threshold * 100:.0f}% cap "
-                    f"({ctx.cat_share:.1f}%) — at/below throttle level, holding."
+                    f"({ctx.cat_share:.1f}%) — at/below the glide target "
+                    f"({cat_target:.3f}×), holding {ctx.curr_mult:.3f}×."
                 )
             else:
-                new_mult = round(max(
-                    throttle_mult,
-                    ctx.curr_mult - (ctx.curr_mult - throttle_mult) * cat_prog * 0.7,
-                ), 3)
+                new_mult = round(cat_target, 3)
                 reason_code = "CAT_CAP_THROTTLE"
                 reason_text = (
                     f"Category approaching {cat_threshold * 100:.0f}% cap "
                     f"({ctx.cat_share:.1f}%) — throttling. "
                     f"Progress: {cat_prog * 100:.0f}%. "
+                    f"Glide target {throttle_mult:.3f}× → {norm_min:.3f}× at cap: "
                     f"{ctx.curr_mult:.3f} → {new_mult:.3f}×."
                 )
         else:
@@ -707,15 +733,26 @@ def _decide_one_mp_ctv(
             )
 
     # ── Final clamp ───────────────────────────────────────────────────────
-    # CAP_KILL / CAT_CAP_KILL use cap_kill_mult floor (floor × 0.10).
-    # PRICE_KILL_HOLD_FALLBACK holds at curr_mult regardless.
-    # All others floor at kill_mult (floor × 0.75).
+    # 2026-08-16: three explicit kill/floor tiers, so kill_mult (0.75) is ONLY
+    # ever reached via an actual price-kill decision — never as the general
+    # everyday floor (that was the bug: kill_mult doubled as both "the price
+    # kill level" AND "the floor for every other decision", which meant any
+    # ordinary pacing decision could silently land at what is functionally a
+    # kill level). The rule now: not publisher-killed, not category-killed,
+    # not price-killed → floor is norm_min (floor × 1.015). Only those three
+    # kill paths can put a deal below its floor price.
+    #   CAP_KILL / CAT_CAP_KILL           → cap_kill_mult (floor × 0.10)
+    #   PRICE_KILL / PRICE_KILL_HOLD      → kill_mult      (floor × 0.75)
+    #   PRICE_KILL_HOLD_FALLBACK          → no floor, holds at curr_mult regardless
+    #   everything else                   → norm_min       (floor × 1.015)
     if reason_code == "PRICE_KILL_HOLD_FALLBACK":
         clamped = round(min(cfg.hard_max.severe, new_mult), 3)
     elif reason_code in ("CAP_KILL", "CAT_CAP_KILL"):
         clamped = round(max(cap_kill_mult, min(cfg.hard_max.severe, new_mult)), 3)
-    else:
+    elif reason_code in ("PRICE_KILL", "PRICE_KILL_HOLD"):
         clamped = round(max(kill_mult, min(cfg.hard_max.severe, new_mult)), 3)
+    else:
+        clamped = round(max(norm_min, min(cfg.hard_max.severe, new_mult)), 3)
 
     # ── Below-L3 protection (hard override) ──────────────────────────────
     # If deal_cpm_li < l3_cpm AND pub is not over its cap, this deal must
