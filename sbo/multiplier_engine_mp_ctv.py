@@ -841,8 +841,16 @@ def _normal_pacing_mp_ctv(
                          and pk_map[k].get("action") in ("PRICE_KILL", "PRICE_KILL_HOLD")]
         has_pk_active = bool(li_pk_keys)
         mostly3_good  = len(ctx.history) >= 3 and sum(1 for h in ctx.history if h in ("OVER","GOOD")) >= 3
+        # 2026-08-17: lowered from 1.07 to 1.01 per pacing review — now that
+        # norm_min (1.015) is the universal non-killed floor across the board,
+        # this sibling-price-kill exception no longer needs to hold a
+        # well-performing deal noticeably richer than everything else on the
+        # line. Since the shared final clamp downstream still enforces norm_min
+        # (1.015) as an absolute floor regardless, setting this to 1.01
+        # (below norm_min) effectively retires the special case: these deals
+        # now land at the same norm_min floor as any other non-killed deal.
         extended_floor = (
-            round(((ctx.floor * 1.07) / ctx.cpm_bid), 3)
+            round(((ctx.floor * 1.01) / ctx.cpm_bid), 3)
             if has_pk_active and mostly3_good else norm_min
         )
         this_kill = round((ctx.floor * cfg.floor.kill_mult) / ctx.cpm_bid, 3)
