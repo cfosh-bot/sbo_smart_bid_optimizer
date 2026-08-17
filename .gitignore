@@ -27,3 +27,4 @@ dashboards/*.csv.gz
 # Test / lint caches
 .pytest_cache/
 .ruff_cache/
+dashboards/archive/
