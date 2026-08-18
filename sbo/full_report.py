@@ -196,6 +196,43 @@ def _fetch_atr(
     return _normalize_atr(df)
 
 
+def _fetch_deal_performance_1day(
+    bw: BeeswaxClient, bw_ids: List[str], run: RunFolder
+) -> pd.DataFrame:
+    """Yesterday-only performance_agg report, keyed on line_item_id + deal_id.
+
+    Same shape as `_fetch_atr` (deal-level, not just the LI-level yes/no flag
+    `_fetch_last_1_day_imps` produces) but scoped to `bid_day: "1 day"` instead
+    of all-time — gives real per-day impressions/spend for the dashboard's
+    actual-clearing-CPM view, without diffing cumulative snapshots.
+
+    Non-critical: callers should catch and log, not fail the run, on error —
+    this feeds dashboard history, not the bid push.
+    """
+    payload = {
+        "view": "performance_agg",
+        "fields": [
+            "line_item_id",
+            "deal_id",
+            "alternative_id",
+            "name",
+            "impression",
+            "media_spend_usd",
+        ],
+        "filters": {"line_item_id": ",".join(bw_ids), "bid_day": "1 day"},
+        "result_format": "csv",
+    }
+    rows = bw.fetch_report(payload, label="Deal Performance 1-Day", row_cap=30000)
+    df = pd.DataFrame(rows)
+    df = _normalize_atr(df)
+    if df.empty:
+        return pd.DataFrame(
+            columns=["line_item_id", "deal_id", "alternative_id", "name",
+                     "impression", "media_spend_usd"]
+        )
+    return df
+
+
 def _normalize_atr(df: pd.DataFrame) -> pd.DataFrame:
     """Canonical lowercase column names + numeric coercion.
 

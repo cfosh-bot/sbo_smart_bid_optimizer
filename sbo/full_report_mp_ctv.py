@@ -38,6 +38,7 @@ from sbo.full_report import (
     FullReportArtifacts,
     _fetch_atr,
     _fetch_deal_floor_prices,
+    _fetch_deal_performance_1day,
     _fetch_last_1_day_imps,
     _fetch_last_3_days_cpm,
     _fetch_li_settings,
@@ -67,6 +68,16 @@ def build_full_report_mp_ctv(
     atr = _fetch_atr(bw, bw_ids, run)
     run.save_dataframe("02_atr", atr)
     run.log(f"ATR fetched: {len(atr):,} rows, {atr['line_item_id'].nunique():,} unique LIs")
+
+    # 1b. Yesterday-only deal-level performance (dashboard history only —
+    # non-critical, never blocks the actual bid decision/push on failure).
+    try:
+        deal_perf_1day = _fetch_deal_performance_1day(bw, bw_ids, run)
+        run.save_dataframe("03b_deal_performance_1day", deal_perf_1day)
+        run.log(f"1-day deal performance fetched: {len(deal_perf_1day):,} rows")
+    except Exception as e:
+        run.log(f"WARNING: 1-day deal performance fetch failed (dashboard history "
+                 f"only, not fatal): {e}")
 
     all_li_ids = bw_ids
 

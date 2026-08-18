@@ -1,33 +1,115 @@
 """
 sbo/dashboard_app.py
 
-MP CTV pacing dashboard -- DuckDB-backed version.
+MP CTV delivery dashboard -- DuckDB-backed, Altair small-multiples.
 
-Instead of loading the full history CSV into pandas (which OOM-killed the
-first version on this droplet's 961MB RAM), every view here is computed by
-a DuckDB SQL query. The CSV is registered as a named view at startup with
-explicit column types -- this avoids auto-detection issues that caused the
-NoneType crash (DuckDB was inferring Run_Date as DATE, Streamlit returned
-datetime.date objects from the slider, and the VARCHAR comparison silently
-failed). All subsequent queries use FROM history, not read_csv_auto().
+Everything is computed by DuckDB SQL against the history CSV registered as a
+named view (never loaded fully into pandas -- this is what fixed the original
+961MB-RAM droplet OOM crash). Altair (bundled with Streamlit, no extra
+dependency) draws the per-entity daily charts so kill days can be marked and
+hovered with the actual decision-reason text.
+
+Performance note: every stacked chart section fetches ALL of its entities'
+daily data in ONE batched query (grouped by entity + day), then splits it in
+pandas -- not one query per entity. The first version of this page fired a
+separate full-table query per row, which is what made clicking into a line
+item/publisher/deal painfully slow.
+
+Four views, chosen at the top:
+  - Line Item View : one daily chart per line item (with that day's pacing %
+                      labeled above the plotted points), click -> its deals
+                      broken out by day (same pacing labels)
+  - Publisher View : one daily chart per publisher, click -> its deals
+  - Deal View      : one daily chart per deal (aggregated across whatever line
+                      items carry it), click -> that deal broken out by line item
+  - Total          : whole-filtered-set daily trend + by-deal/by-line/
+                      by-publisher totals tables
+
+Two chart styles:
+  - "aggregate" rows (line item / publisher / deal-view-top-level / total,
+    all of which can span more than one (line item, deal) pair) hover-show
+    that day's % of deals killed instead of a single reason.
+  - "single-instance" rows (one specific (line item, deal) pair -- reached by
+    drilling into one line item or one publisher, or isolating one deal) mark
+    killed days with a red X and hover-show the actual Decision_Reason text.
+    The bid line is never hidden on a killed day -- killed just means the bid
+    was suppressed toward floor, not that there's no bid to show.
+
+No cap on how many entities render -- every matching entity's chart is drawn
+(use the min-impressions filter to narrow the set if the browser struggles at
+very large volumes).
+
+Every view ends with a decision-reason-by-day stacked bar and a reason-code
+glossary (definitions sourced from sbo/multiplier_engine_mp_ctv.py's own
+comments and decision-reason text).
+
+Today's Run_Date is always excluded -- the day is still accruing.
 
 Run with: streamlit run dashboard_app.py --server.port 8502 --server.address 0.0.0.0
 """
 
+import re
+from datetime import date
+
+import altair as alt
 import duckdb
 import pandas as pd
 import streamlit as st
 
-st.set_page_config(page_title="MP CTV Pacing Dashboard", layout="wide")
+st.set_page_config(page_title="MP CTV Delivery Dashboard", layout="wide")
 
 HISTORY_PATH = "dashboards/mp_ctv_pacing_history.csv.gz"
 
+KILL_REASON_CODES = [
+    "PRICE_KILL",
+    "PRICE_KILL_HOLD",
+    "PRICE_KILL_HOLD_FALLBACK",
+    "CAP_KILL",
+    "CAT_CAP_KILL",
+]
+REASON_CODE_EXPR = "regexp_extract(Decision_Reason, '^([A-Z_]+)', 1)"
+# Inlined as SQL literals, not bound `?` params -- KILL_REASON_CODES is a fixed,
+# developer-controlled list (no injection risk). Binding it as `?` params and
+# reusing that fragment more than once per query silently mis-binds in DuckDB
+# (confirmed empirically while building the first version of this dashboard).
+_KILL_LIST_SQL = ",".join(f"'{c}'" for c in KILL_REASON_CODES)
+IS_KILLED_EXPR = f"({REASON_CODE_EXPR} IN ({_KILL_LIST_SQL}))"
+
+# Sourced from sbo/multiplier_engine_mp_ctv.py's priority-tier comments and the
+# actual Decision_Reason text seen in the data -- not guessed. Worth a sanity
+# check against the pipeline if any of these look off.
+REASON_CODE_GLOSSARY = {
+    "PACE_HOLD_ONTARGET": "Pacing on target (100-105%) -- no bid adjustment",
+    "PACE_UP_AGG": "Behind pace -- aggressive bid increase",
+    "PACE_UP_MOD": "Behind pace -- moderate bid increase",
+    "PACE_UP_CRITICAL": "Significantly behind pace -- maximum bid increase",
+    "PACE_DOWN_AGG": "Ahead of pace -- aggressive bid decrease",
+    "PACE_DOWN_MOD": "Ahead of pace -- moderate bid decrease",
+    "PRICE_KILL": "Clearing price triggered a price-based kill -- bid suppressed toward floor",
+    "PRICE_KILL_HOLD": "Remains price-killed from a prior day",
+    "PRICE_KILL_HOLD_FALLBACK": "Price-kill hold, using fallback logic",
+    "PRICE_UNKILL": "Reinstated from a price-kill -- clearing price recovered",
+    "CAP_KILL": "Publisher share hard-cap kill",
+    "CAP_THROTTLE": "Publisher share throttle (soft reduction, not a full kill)",
+    "CAP_THROTTLE_HOLD": "Publisher share throttle held from a prior day",
+    "CAT_CAP_KILL": "Category share hard-cap kill (537 lines only)",
+    "CAT_CAP_THROTTLE": "Category share throttle (537 lines only)",
+    "CAT_CAP_THROTTLE_HOLD": "Category share throttle held from a prior day",
+    "FIRST_RUN": "First evaluation for this line/deal -- no history yet",
+    "FIRST_RUN_SHORT": "First run, shortened evaluation window",
+    "LINE_PAUSED": "Line item is paused -- no bid changes",
+    "LINE_PAUSED_HOLDING": "Line paused, holding last bid",
+    "LINE_RESUMED": "Line item resumed from a pause",
+    "NO_CPM_BID": "No CPM bid configured for this line",
+    "NO_PACING": "No pacing data available to calculate against",
+    "PRE_FLIGHT_HOLD": "Flight hasn't started yet -- holding",
+}
+
+
+# ── connection ────────────────────────────────────────────────────────────
 
 @st.cache_resource
 def get_connection():
-    """Connect to DuckDB and register the history CSV as a persistent view.
-    Pinning column types at startup avoids repeated auto-detection and keeps
-    Run_Date as VARCHAR so string date parameters always compare correctly."""
     con = duckdb.connect()
     con.execute(f"""
         CREATE OR REPLACE VIEW history AS
@@ -36,18 +118,23 @@ def get_connection():
             compression = 'gzip',
             header = true,
             columns = {{
-                'Run_Date':              'VARCHAR',
-                'SF_Line_Item_ID':       'VARCHAR',
-                'BW_Line_Item_ID':       'VARCHAR',
-                'Publisher':             'VARCHAR',
-                'Deal_ID':               'VARCHAR',
-                'CPM_Bid':               'DOUBLE',
-                'Floor_Price':           'DOUBLE',
-                'Category':              'VARCHAR',
-                'Pacing_Pct':            'DOUBLE',
-                'Effective_Bid_Current': 'DOUBLE',
-                'Effective_Bid_New':     'DOUBLE',
-                'Decision_Reason':       'VARCHAR'
+                'Run_Date':                 'VARCHAR',
+                'SF_Line_Item_ID':          'VARCHAR',
+                'BW_Line_Item_ID':          'VARCHAR',
+                'Line_Item_Name':           'VARCHAR',
+                'Publisher':                'VARCHAR',
+                'Deal_ID':                  'VARCHAR',
+                'CPM_Bid':                  'DOUBLE',
+                'Floor_Price':              'DOUBLE',
+                'Category':                 'VARCHAR',
+                'Pacing_Pct':               'DOUBLE',
+                'Effective_Bid_Current':    'DOUBLE',
+                'Effective_Bid_New':        'DOUBLE',
+                'Decision_Reason':          'VARCHAR',
+                'Deal_Impressions_1Day':    'DOUBLE',
+                'Deal_Spend_1Day_USD':      'DOUBLE',
+                'Targets_537':              'VARCHAR',
+                'Included_Deal_Lists':      'VARCHAR'
             }}
         )
     """)
@@ -57,10 +144,7 @@ def get_connection():
 con = get_connection()
 
 
-def q(sql: str, params=None):
-    """Execute SQL against the registered history view; return a DataFrame.
-    Returns an empty DataFrame (never None) on failure so callers can safely
-    check .empty without an additional None guard."""
+def q(sql: str, params=None) -> pd.DataFrame:
     try:
         result = con.execute(sql, params or []).fetchdf()
         return result if result is not None else pd.DataFrame()
@@ -69,130 +153,715 @@ def q(sql: str, params=None):
         return pd.DataFrame()
 
 
+def safe_label(parts, fallback) -> str:
+    """Join non-null, non-'None' parts with ' · '; fall back to a raw ID when
+    nothing usable is available (e.g. Line_Item_Name not yet captured for any
+    row before this dashboard's schema change)."""
+    clean = [str(p) for p in parts if pd.notna(p) and str(p).strip() not in ("", "None", "nan")]
+    return " · ".join(clean) if clean else str(fallback)
+
+
+def safe_int(v) -> int:
+    """int(v or 0) crashes on NaN -- NaN is truthy in Python, so `NaN or 0`
+    evaluates to NaN, not 0. Confirmed as a real crash: any candidate deal
+    with zero actual delivery (a real, common case -- Option A keeps them
+    visible rather than dropping them) has NULL Impressions, which reached
+    `int(nan)` and took the whole app down once no min-impressions filter
+    was screening them out."""
+    return int(v) if pd.notna(v) else 0
+
+
+def safe_num(v) -> float:
+    return float(v) if pd.notna(v) else 0.0
+
+
+# ── filter option loaders ────────────────────────────────────────────────
+
 @st.cache_data(ttl=600)
-def load_summary():
-    row = con.execute(
-        "SELECT COUNT(*), MIN(Run_Date), MAX(Run_Date), COUNT(DISTINCT Run_Date) FROM history"
-    ).fetchone()
-    return row
+def load_filter_options(today_str: str):
+    dates = q("SELECT DISTINCT Run_Date FROM history WHERE Run_Date < ? ORDER BY Run_Date",
+              [today_str])["Run_Date"].tolist()
+    categories = q("SELECT DISTINCT Category FROM history WHERE Category IS NOT NULL ORDER BY Category")["Category"].tolist()
+    publishers = q("SELECT DISTINCT Publisher FROM history WHERE Publisher IS NOT NULL ORDER BY Publisher")["Publisher"].tolist()
+    bw_ids = q("SELECT DISTINCT BW_Line_Item_ID FROM history WHERE BW_Line_Item_ID IS NOT NULL ORDER BY BW_Line_Item_ID")["BW_Line_Item_ID"].tolist()
+    sf_ids = q("SELECT DISTINCT SF_Line_Item_ID FROM history WHERE SF_Line_Item_ID IS NOT NULL ORDER BY SF_Line_Item_ID")["SF_Line_Item_ID"].tolist()
+    li_names = q("SELECT DISTINCT Line_Item_Name FROM history WHERE Line_Item_Name IS NOT NULL ORDER BY Line_Item_Name")["Line_Item_Name"].tolist()
+    deal_ids = q("SELECT DISTINCT Deal_ID FROM history WHERE Deal_ID IS NOT NULL ORDER BY Deal_ID")["Deal_ID"].tolist()
+    targets_537 = q("SELECT DISTINCT Targets_537 FROM history WHERE Targets_537 IS NOT NULL ORDER BY Targets_537")["Targets_537"].tolist()
+    reason_codes = q(f"""
+        SELECT DISTINCT {REASON_CODE_EXPR} AS Reason_Code FROM history
+        WHERE Decision_Reason IS NOT NULL ORDER BY Reason_Code
+    """)["Reason_Code"].tolist()
+    return dates, categories, publishers, bw_ids, sf_ids, li_names, deal_ids, targets_537, reason_codes
 
 
-@st.cache_data(ttl=600)
-def load_filter_options():
-    dates = con.execute(
-        "SELECT DISTINCT Run_Date FROM history ORDER BY Run_Date"
-    ).fetchdf()["Run_Date"].tolist()
-    categories = con.execute(
-        "SELECT DISTINCT Category FROM history WHERE Category IS NOT NULL ORDER BY Category"
-    ).fetchdf()["Category"].tolist()
-    publishers = con.execute(
-        "SELECT DISTINCT Publisher FROM history WHERE Publisher IS NOT NULL ORDER BY Publisher"
-    ).fetchdf()["Publisher"].tolist()
-    return dates, categories, publishers
+def picker(label: str, options: list[str], key: str):
+    """One widget: search-and-click like a normal multiselect, OR paste a
+    comma/newline-separated list and press Enter -- either way you get a set
+    of selected values. `accept_new_options` lets the box accept typed/pasted
+    text that isn't in the pre-loaded option list; we then split any pasted
+    entry on commas/newlines so one paste becomes many selections instead of
+    one giant literal tag."""
+    raw = st.multiselect(
+        label, options, key=f"{key}_multi", accept_new_options=True,
+        placeholder="Search & select, or paste comma/newline-separated IDs",
+    )
+    values = set()
+    for item in raw:
+        for part in re.split(r"[,\n]+", str(item)):
+            part = part.strip()
+            if part:
+                values.add(part)
+    return sorted(values)
 
 
-def build_filter_sql(start_date, end_date, cats, pubs):
-    """Returns (where_clause, params) for the shared filter set.
-    str() on the date values ensures VARCHAR comparison even when Streamlit
-    returns datetime.date objects from select_slider."""
-    clauses = ["Run_Date BETWEEN ? AND ?"]
-    params = [str(start_date), str(end_date)]
-    if cats:
-        placeholders = ",".join(["?"] * len(cats))
-        clauses.append(f"Category IN ({placeholders})")
-        params.extend(cats)
-    if pubs:
-        placeholders = ",".join(["?"] * len(pubs))
-        clauses.append(f"Publisher IN ({placeholders})")
-        params.extend(pubs)
+# ── shared WHERE builder ─────────────────────────────────────────────────
+
+FLOOR_OPERATORS = {">": ">", "<": "<", "=": "="}
+
+
+def build_filter_sql(today_str, start_date, end_date, cats, pubs, bw_ids, sf_ids, li_names, deal_ids,
+                      targets_537=None, reason_codes=None, floor_op=None, floor_val=None):
+    clauses = ["Run_Date BETWEEN ? AND ?", "Run_Date < ?"]
+    params = [str(start_date), str(end_date), today_str]
+
+    def _in(col, values):
+        if values:
+            clauses.append(f"{col} IN ({','.join(['?'] * len(values))})")
+            params.extend(values)
+
+    _in("Category", cats)
+    _in("Publisher", pubs)
+    _in("BW_Line_Item_ID", bw_ids)
+    _in("SF_Line_Item_ID", sf_ids)
+    _in("Line_Item_Name", li_names)
+    _in("Deal_ID", deal_ids)
+    _in("Targets_537", targets_537)
+    if reason_codes:
+        clauses.append(f"{REASON_CODE_EXPR} IN ({','.join(['?'] * len(reason_codes))})")
+        params.extend(reason_codes)
+    if floor_op and floor_val is not None:
+        if floor_op not in FLOOR_OPERATORS:
+            raise ValueError(f"Unsupported floor price operator: {floor_op!r}")
+        clauses.append(f"Floor_Price {FLOOR_OPERATORS[floor_op]} ?")
+        params.append(floor_val)
     return " AND ".join(clauses), params
 
 
-# ── Page header ──────────────────────────────────────────────────────────────
+# ── aggregate metrics (multi-instance rows: LI / publisher / deal-view-top) ──
 
-st.title("MP CTV Pacing Dashboard")
-st.caption("DuckDB-backed -- queries the history file directly, never loads it all into memory")
+AGG_SELECT = f"""
+    SUM(Deal_Impressions_1Day) AS Impressions,
+    SUM(Deal_Spend_1Day_USD) AS Spend,
+    CASE WHEN SUM(Deal_Impressions_1Day) > 0
+         THEN SUM(Deal_Spend_1Day_USD) / SUM(Deal_Impressions_1Day) * 1000
+         ELSE NULL END AS Actual_Clearing_CPM,
+    AVG(Effective_Bid_Current) FILTER (
+        WHERE Decision_Reason IS NOT NULL AND NOT {IS_KILLED_EXPR}
+    ) AS Avg_Bid,
+    100.0 * COUNT(*) FILTER (WHERE Decision_Reason IS NOT NULL AND {IS_KILLED_EXPR})
+        / NULLIF(COUNT(*) FILTER (WHERE Decision_Reason IS NOT NULL), 0) AS Pct_Killed
+"""
 
-with st.spinner("Reading file summary..."):
-    total_rows, min_date, max_date, n_days = load_summary()
 
-st.success(f"{total_rows:,} rows across {n_days} days  ({min_date} to {max_date})")
+IMPRESSIONS_OPERATORS = [">=", ">", "<", "="]
 
-dates, categories, publishers = load_filter_options()
 
-# ── Filters ──────────────────────────────────────────────────────────────────
+def entity_summary(group_cols: list[str], where_sql: str, params: list, min_impressions: float,
+                    extra_select: str = "", order_by: str = "Impressions DESC NULLS LAST",
+                    impressions_op: str = ">="):
+    """One row per entity (LI / publisher / deal), aggregated over the whole
+    filtered date range -- feeds both the entity list and the breakout tables."""
+    if impressions_op not in IMPRESSIONS_OPERATORS:
+        raise ValueError(f"Unsupported impressions operator: {impressions_op!r}")
+    group_sql = ", ".join(group_cols)
+    # group_cols[0] is always the true identity column at every call site
+    # (BW_Line_Item_ID / Publisher / Deal_ID). Excluding NULL there matters
+    # beyond just tidiness: a NULL id later flows into an IN(...) parameter
+    # list as a Python NaN (not the string "nan"), which makes DuckDB infer
+    # the whole list as DOUBLE and try to cast the id column to a number --
+    # confirmed by reproducing it with Publisher's real NULL rows.
+    sql = f"""
+        SELECT {group_sql}, {extra_select} {AGG_SELECT}
+        FROM history
+        WHERE {where_sql} AND {group_cols[0]} IS NOT NULL
+        GROUP BY {group_sql}
+        HAVING COALESCE(SUM(Deal_Impressions_1Day), 0) {impressions_op} ?
+        ORDER BY {order_by}
+    """
+    df = q(sql, params + [min_impressions])
+    if not df.empty and "Impressions" in df.columns:
+        total = df["Impressions"].sum()
+        df["Impression_Share_Pct"] = (df["Impressions"] / total * 100).round(2) if total else None
+    return df
 
-col1, col2, col3 = st.columns(3)
-with col1:
-    date_range = st.select_slider(
-        "Date range", options=dates, value=(dates[0], dates[-1])
-    )
-with col2:
-    selected_cats = st.multiselect("Category filter (empty = all)", categories)
-with col3:
-    selected_pubs = st.multiselect("Publisher filter (empty = all)", publishers)
 
-where_sql, params = build_filter_sql(
-    date_range[0], date_range[1], selected_cats, selected_pubs
-)
-
-# ── Row count metric ─────────────────────────────────────────────────────────
-
-count_df = q(f"SELECT COUNT(*) AS n FROM history WHERE {where_sql}", params)
-row_count = int(count_df["n"].iloc[0]) if not count_df.empty else 0
-st.metric("Rows in view", f"{row_count:,}")
-
-# ── Volume + pacing charts ───────────────────────────────────────────────────
-
-st.subheader("Row volume by day")
-daily = q(
-    f"""SELECT Run_Date,
-               COUNT(*) AS rows,
-               AVG(Pacing_Pct) AS avg_pacing_pct
+def daily_totals(where_sql: str, params: list) -> pd.DataFrame:
+    """Whole-filtered-set daily trend -- no entity grouping at all. Feeds the
+    Total view's headline chart."""
+    sql = f"""
+        SELECT Run_Date,
+            SUM(Deal_Impressions_1Day) AS Impressions,
+            CASE WHEN SUM(Deal_Impressions_1Day) > 0
+                 THEN SUM(Deal_Spend_1Day_USD) / SUM(Deal_Impressions_1Day) * 1000
+                 ELSE NULL END AS Actual_Clearing_CPM,
+            AVG(Effective_Bid_Current) FILTER (
+                WHERE Decision_Reason IS NOT NULL AND NOT {IS_KILLED_EXPR}
+            ) AS Avg_Bid,
+            100.0 * COUNT(*) FILTER (WHERE Decision_Reason IS NOT NULL AND {IS_KILLED_EXPR})
+                / NULLIF(COUNT(*) FILTER (WHERE Decision_Reason IS NOT NULL), 0) AS Pct_Killed
         FROM history
         WHERE {where_sql}
         GROUP BY Run_Date
-        ORDER BY Run_Date""",
-    params,
-)
-if not daily.empty:
-    st.bar_chart(daily.set_index("Run_Date")["rows"])
+        ORDER BY Run_Date
+    """
+    return q(sql, params)
 
-st.subheader("Average pacing % by day")
-if not daily.empty:
-    st.line_chart(daily.set_index("Run_Date")["avg_pacing_pct"])
 
-# ── Decision reason breakdown ─────────────────────────────────────────────────
-
-st.subheader("Decision reason breakdown by day (top 8)")
-reason_daily = q(
-    f"""SELECT Run_Date,
-               regexp_extract(Decision_Reason, '^([A-Z_]+)', 1) AS Reason_Code,
-               COUNT(*) AS n
+def daily_aggregate_batch(id_col: str, where_sql: str, params: list, entity_ids: list[str]) -> pd.DataFrame:
+    """ALL entities' daily data in one query, grouped by (entity, day) --
+    replaces a one-query-per-entity loop."""
+    if not entity_ids:
+        return pd.DataFrame()
+    placeholders = ",".join(["?"] * len(entity_ids))
+    sql = f"""
+        SELECT {id_col} AS Entity_ID, Run_Date,
+            SUM(Deal_Impressions_1Day) AS Impressions,
+            CASE WHEN SUM(Deal_Impressions_1Day) > 0
+                 THEN SUM(Deal_Spend_1Day_USD) / SUM(Deal_Impressions_1Day) * 1000
+                 ELSE NULL END AS Actual_Clearing_CPM,
+            AVG(Effective_Bid_Current) FILTER (
+                WHERE Decision_Reason IS NOT NULL AND NOT {IS_KILLED_EXPR}
+            ) AS Avg_Bid,
+            AVG(Pacing_Pct) AS Pacing_Pct,
+            100.0 * COUNT(*) FILTER (WHERE Decision_Reason IS NOT NULL AND {IS_KILLED_EXPR})
+                / NULLIF(COUNT(*) FILTER (WHERE Decision_Reason IS NOT NULL), 0) AS Pct_Killed
         FROM history
-        WHERE {where_sql}
+        WHERE {where_sql} AND {id_col} IN ({placeholders})
+        GROUP BY {id_col}, Run_Date
+        ORDER BY {id_col}, Run_Date
+    """
+    df = q(sql, params + entity_ids)
+    if not df.empty:
+        df["Entity_ID"] = df["Entity_ID"].astype(str)
+    return df
+
+
+def single_instance_batch(where_sql: str, params: list, li_deal_pairs: list[tuple]) -> pd.DataFrame:
+    """ALL (line item, deal) pairs in one query. The dedupe key (Run_Date,
+    BW_Line_Item_ID, Deal_ID) guarantees at most one row per pair per day, so
+    no aggregation is needed -- just a wide OR filter."""
+    if not li_deal_pairs:
+        return pd.DataFrame()
+    clauses, p = [], []
+    for li, deal in li_deal_pairs:
+        clauses.append("(BW_Line_Item_ID = ? AND Deal_ID = ?)")
+        p.extend([li, deal])
+    sql = f"""
+        SELECT BW_Line_Item_ID, Deal_ID, Run_Date, Deal_Impressions_1Day AS Impressions,
+            Effective_Bid_Current AS Avg_Bid,
+            CASE WHEN Deal_Impressions_1Day > 0
+                 THEN Deal_Spend_1Day_USD / Deal_Impressions_1Day * 1000
+                 ELSE NULL END AS Actual_Clearing_CPM,
+            Decision_Reason, Pacing_Pct,
+            {IS_KILLED_EXPR} AS Is_Killed
+        FROM history
+        WHERE {where_sql} AND ({" OR ".join(clauses)})
+        ORDER BY BW_Line_Item_ID, Deal_ID, Run_Date
+    """
+    df = q(sql, params + p)
+    if not df.empty:
+        df["BW_Line_Item_ID"] = df["BW_Line_Item_ID"].astype(str)
+        df["Deal_ID"] = df["Deal_ID"].astype(str)
+    return df
+
+
+# ── chart builders (Altair) ──────────────────────────────────────────────
+
+def _date_axis():
+    return alt.Axis(labelAngle=-45)
+
+
+def _y_plan(daily_df: pd.DataFrame, value_cols: list[str], headroom: bool):
+    """Explicit $5-interval gridlines with a pinned domain.
+
+    Two bugs had to be fixed to get here: (1) tickMinStep only sets a *floor*
+    on tick spacing -- Vega-Lite's own 'nice number' rounding still picked 20
+    or 40 -- so tick values must be listed explicitly. (2) when a pacing-label
+    layer (whose Y values run ~18% above the line data, to sit above the
+    points) is combined with the line layer via `+`, Vega-Lite recomputes a
+    *shared* domain across both layers and silently drops the explicit tick
+    values that no longer span it. Pinning an identical `scale(domain=...)`
+    on every layer -- lines, kill marks, and labels alike -- stops that
+    recomputation from ever happening.
+    """
+    present = [c for c in value_cols if c in daily_df.columns]
+    vmax = daily_df[present].max(skipna=True).max() if present else None
+    if pd.isna(vmax) or vmax is None or vmax <= 0:
+        return alt.Axis(title="$"), alt.Scale()
+    raw_top = vmax * 1.2 if headroom else vmax  # match the label layer's 1.18x headroom
+    top = int((raw_top // 5 + 2) * 5)
+    axis = alt.Axis(title="$", values=list(range(0, top + 1, 5)), labelOverlap=False, labelFontSize=8)
+    scale = alt.Scale(domain=[0, top])
+    return axis, scale
+
+
+def _pacing_label_layer(daily_df: pd.DataFrame, axis: alt.Axis, scale: alt.Scale) -> alt.Chart:
+    """That day's pacing %, plotted as text directly above that day's bid/CPM
+    points -- not a single summary number, one label per day.
+
+    Passing the SAME `axis` object as the line layer (not just the same
+    `scale`) turned out to matter: with only `scale` shared, Vega-Lite still
+    treats the two layers' y-axis definitions as needing to be resolved (this
+    layer has none), and it silently discarded the line layer's explicit
+    $5-interval tick `values` in that resolution -- confirmed by reproducing
+    it in an isolated single-chart test page outside this whole dashboard."""
+    label_df = daily_df.copy()
+    value_cols = [c for c in ("Avg_Bid", "Actual_Clearing_CPM") if c in label_df.columns]
+    label_df["Label_Y"] = label_df[value_cols].max(axis=1, skipna=True) * 1.18
+    label_df["Pacing_Label"] = label_df["Pacing_Pct"].apply(lambda v: f"{v:.0%}" if pd.notna(v) else "")
+    return alt.Chart(label_df).mark_text(dy=-4, fontSize=10, color="#666").encode(
+        x=alt.X("Run_Date:O", axis=_date_axis()),
+        y=alt.Y("Label_Y:Q", axis=axis, scale=scale),
+        text="Pacing_Label:N",
+    )
+
+
+def chart_aggregate(daily_df: pd.DataFrame, show_pacing_labels: bool = False, height: int = 130):
+    """Two-line (Avg Bid / Actual Clearing CPM) daily chart. Hover shows that
+    day's % of deals killed -- appropriate whenever the row can span more
+    than one (line item, deal) pair."""
+    if daily_df.empty:
+        return None
+    melted = daily_df.melt(
+        id_vars=["Run_Date", "Pct_Killed"],
+        value_vars=["Avg_Bid", "Actual_Clearing_CPM"],
+        var_name="Metric", value_name="Value",
+    )
+    axis, scale = _y_plan(daily_df, ["Avg_Bid", "Actual_Clearing_CPM"], headroom=show_pacing_labels)
+    lines = alt.Chart(melted).mark_line(point=True).encode(
+        x=alt.X("Run_Date:O", title=None, axis=_date_axis()),
+        y=alt.Y("Value:Q", title="$", axis=axis, scale=scale),
+        color=alt.Color("Metric:N", legend=alt.Legend(orient="right", title=None)),
+        tooltip=["Run_Date", "Metric", alt.Tooltip("Value:Q", format="$.2f"),
+                 alt.Tooltip("Pct_Killed:Q", format=".1f", title="% killed that day")],
+    ).properties(height=height)
+    if show_pacing_labels and "Pacing_Pct" in daily_df.columns:
+        return lines + _pacing_label_layer(daily_df, axis, scale)
+    return lines
+
+
+def chart_single_instance(daily_df: pd.DataFrame, show_pacing_labels: bool = False, height: int = 130):
+    """Two-line chart for exactly one (line item, deal) pair. Killed days get
+    a red X on the bid line; hovering any point (killed or not) shows the
+    actual Decision_Reason text."""
+    if daily_df.empty:
+        return None
+    melted = daily_df.melt(
+        id_vars=["Run_Date", "Decision_Reason", "Is_Killed"],
+        value_vars=["Avg_Bid", "Actual_Clearing_CPM"],
+        var_name="Metric", value_name="Value",
+    )
+    axis, scale = _y_plan(daily_df, ["Avg_Bid", "Actual_Clearing_CPM"], headroom=show_pacing_labels)
+    base = alt.Chart(melted).mark_line(point=True).encode(
+        x=alt.X("Run_Date:O", title=None, axis=_date_axis()),
+        y=alt.Y("Value:Q", title="$", axis=axis, scale=scale),
+        color=alt.Color("Metric:N", legend=alt.Legend(orient="right", title=None)),
+        tooltip=["Run_Date", "Metric", alt.Tooltip("Value:Q", format="$.2f"), "Decision_Reason"],
+    ).properties(height=height)
+
+    chart = base
+    kills = daily_df[daily_df["Is_Killed"] == True]  # noqa: E712
+    if not kills.empty:
+        kill_marks = alt.Chart(kills).mark_point(shape="cross", size=140, color="red", strokeWidth=3).encode(
+            x=alt.X("Run_Date:O", title=None, axis=_date_axis()),
+            y=alt.Y("Avg_Bid:Q", scale=scale),
+            tooltip=["Run_Date", alt.Tooltip("Avg_Bid:Q", format="$.2f", title="Bid (killed)"), "Decision_Reason"],
+        )
+        chart = chart + kill_marks
+    if show_pacing_labels and "Pacing_Pct" in daily_df.columns:
+        chart = chart + _pacing_label_layer(daily_df, axis, scale)
+    return chart
+
+
+# ── row renderers (no pagination -- every matching entity renders) ──────
+
+def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
+                            where_sql: str, params: list, show_pacing_labels: bool = False):
+    """Stacked list of aggregate-style charts (LI / publisher / deal-view-top).
+    Returns the id clicked this run, or None."""
+    if entities.empty:
+        st.info("No rows match the current filters.")
+        return None
+    # Defensive: entity_summary's grouping should already guarantee one row
+    # per id_col, but a duplicate here would crash st.button on a repeated
+    # key, so belt-and-suspenders it.
+    entities = entities.drop_duplicates(subset=[id_col])
+    all_ids = entities[id_col].dropna().astype(str).tolist()
+    batch = daily_aggregate_batch(id_col, where_sql, params, all_ids)
+
+    clicked = None
+    for _, ent in entities.iterrows():
+        eid = str(ent[id_col])
+        left, right = st.columns([1, 4])
+        with left:
+            label = safe_label(
+                [ent.get("Line_Item_Name")] if "Line_Item_Name" in ent else [ent.get(id_col)], eid
+            ) if id_col == "BW_Line_Item_ID" else safe_label([ent.get(id_col)], eid)
+            st.markdown(f"#### {label}")
+            extra = f"BW {ent['BW_Line_Item_ID']}" if id_col == "BW_Line_Item_ID" and "SF_Line_Item_ID" in ent else ""
+            if extra and "SF_Line_Item_ID" in ent:
+                extra += f" · SF {ent['SF_Line_Item_ID']}"
+            if ent.get("Category") and id_col == "Publisher":
+                extra = str(ent["Category"])
+            if ent.get("Publisher") and id_col == "Deal_ID":
+                extra = str(ent["Publisher"])
+            st.caption(" · ".join(x for x in [extra, f"{safe_int(ent['Impressions']):,} imps"] if x))
+            if st.button("View →", key=f"{key_prefix}_{eid}"):
+                clicked = eid
+        with right:
+            daily = batch[batch["Entity_ID"] == eid] if not batch.empty else pd.DataFrame()
+            chart = chart_aggregate(daily, show_pacing_labels=show_pacing_labels)
+            if chart is not None:
+                st.altair_chart(chart, use_container_width=True, theme=None)
+            else:
+                st.caption("No daily delivery data for this entity in range.")
+    return clicked
+
+
+def render_single_instance_stack(entities: pd.DataFrame, label_fn, where_sql: str, params: list,
+                                  key_prefix: str, show_pacing_labels: bool = False):
+    """Stacked list of single-(line item, deal)-instance charts, e.g. the deals
+    under one line item/publisher, or the line items carrying one isolated deal."""
+    if entities.empty:
+        st.info("No rows match the current filters.")
+        return
+    entities = entities.drop_duplicates(subset=["BW_Line_Item_ID", "Deal_ID"])
+    pairs = list(zip(entities["BW_Line_Item_ID"].astype(str), entities["Deal_ID"].astype(str)))
+    batch = single_instance_batch(where_sql, params, pairs)
+
+    for _, ent in entities.iterrows():
+        li_id, deal_id = str(ent["BW_Line_Item_ID"]), str(ent["Deal_ID"])
+        left, right = st.columns([1, 4])
+        with left:
+            st.markdown(label_fn(ent))
+            st.caption(f"{safe_int(ent['Impressions']):,} imps")
+        with right:
+            daily = batch[(batch["BW_Line_Item_ID"] == li_id) & (batch["Deal_ID"] == deal_id)] if not batch.empty else pd.DataFrame()
+            chart = chart_single_instance(daily, show_pacing_labels=show_pacing_labels)
+            if chart is not None:
+                st.altair_chart(chart, use_container_width=True, theme=None)
+            else:
+                st.caption("No daily delivery data for this pair in range.")
+
+
+def render_reason_footer(where_sql: str, params: list):
+    """Decision-reason-by-day stacked bar + reason code glossary -- shown at
+    the bottom of every view."""
+    st.divider()
+    st.subheader("Decision reason breakdown by day")
+    reason_daily = q(f"""
+        SELECT Run_Date, {REASON_CODE_EXPR} AS Reason_Code, COUNT(*) AS n
+        FROM history
+        WHERE {where_sql} AND Decision_Reason IS NOT NULL
         GROUP BY Run_Date, Reason_Code
-        ORDER BY Run_Date""",
-    params,
+        ORDER BY Run_Date
+    """, params)
+    if not reason_daily.empty:
+        top_reasons = (
+            reason_daily.groupby("Reason_Code")["n"].sum().sort_values(ascending=False).head(8).index
+        )
+        pivot = (
+            reason_daily[reason_daily["Reason_Code"].isin(top_reasons)]
+            .pivot(index="Run_Date", columns="Reason_Code", values="n")
+            .fillna(0)
+        )
+        st.bar_chart(pivot)
+    else:
+        st.caption("No decisioned rows in range.")
+
+    st.caption("Reason code library")
+    glossary_df = pd.DataFrame(REASON_CODE_GLOSSARY.items(), columns=["Code", "Meaning"])
+    st.dataframe(glossary_df, use_container_width=True, hide_index=True)
+
+
+# ── page setup ────────────────────────────────────────────────────────────
+
+st.title("MP CTV Delivery Dashboard")
+
+today_str = date.today().isoformat()
+(dates, categories, publishers, bw_ids_all, sf_ids_all, li_names_all, deal_ids_all,
+ targets_537_all, reason_codes_all) = load_filter_options(today_str)
+
+if not dates:
+    st.warning("No complete (non-today) days available yet.")
+    st.stop()
+
+st.subheader("Filters")
+f1, f2 = st.columns(2)
+with f1:
+    date_range = st.select_slider("Date range", options=dates, value=(dates[0], dates[-1]))
+with f2:
+    i1, i2 = st.columns([1, 2])
+    with i1:
+        impressions_op = st.selectbox("Impressions", IMPRESSIONS_OPERATORS, index=0, label_visibility="visible")
+    with i2:
+        min_impressions = st.number_input("Total impressions in range (per entity)", min_value=0, value=0, step=100)
+
+f3, f4 = st.columns(2)
+with f3:
+    selected_cats = st.multiselect("Category", categories)
+with f4:
+    selected_pubs = st.multiselect("Publisher", publishers)
+
+f5, f6 = st.columns(2)
+with f5:
+    selected_targets_537 = st.multiselect("Targets 537 (marketplace / 537 / none)", targets_537_all)
+with f6:
+    selected_reason_codes = st.multiselect("Decision reason code", reason_codes_all)
+
+f7, f8 = st.columns(2)
+with f7:
+    floor_op = st.selectbox("Floor price", ["No filter", ">", "<", "="], index=0)
+with f8:
+    floor_val = st.number_input("Floor price value ($)", min_value=0.0, value=0.0, step=0.5,
+                                 disabled=(floor_op == "No filter"))
+
+selected_bw = picker("BW Line Item ID", bw_ids_all, "bw")
+selected_sf = picker("SF Line Item ID", sf_ids_all, "sf")
+selected_names = picker("Line Item Name", li_names_all, "liname")
+selected_deals = picker("Deal ID", deal_ids_all, "deal")
+
+st.caption(
+    "Every matching entity renders its own chart on these pages -- no page limit. "
+    "If a view feels sluggish with very broad filters, narrow with min impressions "
+    "or the ID/name filters above."
 )
-if not reason_daily.empty:
-    top_reasons = (
-        reason_daily.groupby("Reason_Code")["n"]
-        .sum()
-        .sort_values(ascending=False)
-        .head(8)
-        .index
-    )
-    pivot = (
-        reason_daily[reason_daily["Reason_Code"].isin(top_reasons)]
-        .pivot(index="Run_Date", columns="Reason_Code", values="n")
-        .fillna(0)
-    )
-    st.bar_chart(pivot)
 
-# ── Sample rows ───────────────────────────────────────────────────────────────
+where_sql, params = build_filter_sql(
+    today_str, date_range[0], date_range[1], selected_cats, selected_pubs,
+    selected_bw, selected_sf, selected_names, selected_deals,
+    targets_537=selected_targets_537, reason_codes=selected_reason_codes,
+    floor_op=None if floor_op == "No filter" else floor_op,
+    floor_val=floor_val if floor_op != "No filter" else None,
+)
 
-st.subheader("Sample rows (first 200 matching filters)")
-sample = q(f"SELECT * FROM history WHERE {where_sql} LIMIT 200", params)
-if not sample.empty:
-    st.dataframe(sample, width="stretch")
+view = st.radio("View", ["Line Item View", "Publisher View", "Deal View", "Total"], horizontal=True)
+
+for key in ("drill_li", "drill_pub", "drill_deal"):
+    if key not in st.session_state:
+        st.session_state[key] = None
+
+# ── header stats ─────────────────────────────────────────────────────────
+
+overview = q(f"SELECT COUNT(*) AS rows, {AGG_SELECT} FROM history WHERE {where_sql}", params)
+
+m1, m2, m3, m4, m5 = st.columns(5)
+if not overview.empty:
+    row = overview.iloc[0]
+    m1.metric("Impressions", f"{safe_int(row['Impressions']):,}")
+    m2.metric("Spend", f"${safe_num(row['Spend']):,.0f}")
+    m3.metric("Actual clearing CPM", f"${row['Actual_Clearing_CPM']:,.2f}" if pd.notna(row["Actual_Clearing_CPM"]) else "N/A")
+    m4.metric("Avg bid (excl. killed)", f"${row['Avg_Bid']:,.2f}" if pd.notna(row["Avg_Bid"]) else "N/A")
+    m5.metric("% of deals killed", f"{row['Pct_Killed']:.1f}%" if pd.notna(row["Pct_Killed"]) else "N/A")
+
+st.divider()
+
+# ══════════════════════════════════════════════════════════════════════════
+# LINE ITEM VIEW
+# ══════════════════════════════════════════════════════════════════════════
+
+if view == "Line Item View":
+    if not st.session_state.drill_li:
+        st.subheader("Line items")
+        li_df = entity_summary(
+            ["BW_Line_Item_ID"], where_sql, params, min_impressions, impressions_op=impressions_op,
+            extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
+                          "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
+        )
+        clicked = render_aggregate_stack(li_df, "BW_Line_Item_ID", "li", where_sql, params, show_pacing_labels=True)
+        if clicked:
+            st.session_state.drill_li = clicked
+            st.rerun()
+    else:
+        li_id = st.session_state.drill_li
+        if st.button("⬅ Back to line items"):
+            st.session_state.drill_li = None
+            st.rerun()
+        li_where = where_sql + " AND BW_Line_Item_ID = ?"
+        li_params = params + [li_id]
+        name_row = q("SELECT DISTINCT Line_Item_Name FROM history WHERE BW_Line_Item_ID = ? LIMIT 1", [li_id])
+        li_name = safe_label([name_row.iloc[0]["Line_Item_Name"]] if not name_row.empty else [], li_id)
+        st.subheader(f"Deals for line item {li_name} ({li_id})")
+
+        deal_df = entity_summary(
+            ["Deal_ID", "Publisher", "Category", "BW_Line_Item_ID"], li_where, li_params, min_impressions, impressions_op=impressions_op,
+            extra_select="arg_max(Floor_Price, Run_Date) AS Floor_Price,",
+        )
+        render_single_instance_stack(
+            deal_df,
+            lambda ent: f"**{ent['Deal_ID']}**\n\n{ent['Publisher']} · {ent['Category']} · Floor ${ent['Floor_Price']:.2f}"
+            if pd.notna(ent.get("Floor_Price")) else f"**{ent['Deal_ID']}**\n\n{ent['Publisher']} · {ent['Category']}",
+            where_sql, params, "li_deal", show_pacing_labels=True,
+        )
+
+        st.subheader("Breakout: impressions, bid & CPM by publisher / category / deal")
+        st.dataframe(
+            deal_df[["Publisher", "Category", "Deal_ID", "Floor_Price", "Impressions", "Impression_Share_Pct",
+                     "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+            use_container_width=True, hide_index=True,
+        )
+
+# ══════════════════════════════════════════════════════════════════════════
+# PUBLISHER VIEW
+# ══════════════════════════════════════════════════════════════════════════
+
+elif view == "Publisher View":
+    if not st.session_state.drill_pub:
+        st.subheader("Publishers")
+        pub_df = entity_summary(
+            ["Publisher"], where_sql, params, min_impressions, impressions_op=impressions_op,
+            extra_select="mode(Category) AS Category,",
+        )
+        clicked = render_aggregate_stack(pub_df, "Publisher", "pub", where_sql, params)
+        if clicked:
+            st.session_state.drill_pub = clicked
+            st.rerun()
+
+        st.subheader("All publishers -- summary")
+        st.dataframe(
+            pub_df[["Publisher", "Category", "Impressions", "Impression_Share_Pct",
+                    "Actual_Clearing_CPM", "Avg_Bid", "Pct_Killed"]],
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        pub = st.session_state.drill_pub
+        if st.button("⬅ Back to publishers"):
+            st.session_state.drill_pub = None
+            st.rerun()
+        st.subheader(f"Deals for publisher {pub}")
+        pub_where = where_sql + " AND Publisher = ?"
+        pub_params = params + [pub]
+
+        deal_df = entity_summary(
+            ["Deal_ID", "Publisher", "Category", "BW_Line_Item_ID"], pub_where, pub_params, min_impressions, impressions_op=impressions_op,
+            extra_select="arg_max(Floor_Price, Run_Date) AS Floor_Price, "
+                          "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
+        )
+
+        def _pub_deal_label(ent):
+            # A Deal_ID can be shared across more than one line item under the
+            # same publisher (confirmed with real data) -- without the line
+            # item name/id here, repeated Deal_IDs would render as identical,
+            # undistinguishable rows.
+            li = safe_label([ent.get("Line_Item_Name")], ent["BW_Line_Item_ID"])
+            floor = f" · Floor ${ent['Floor_Price']:.2f}" if pd.notna(ent.get("Floor_Price")) else ""
+            return f"**{ent['Deal_ID']}**\n\n{ent['Category']}{floor}\n\nLine item: {li} (BW {ent['BW_Line_Item_ID']})"
+
+        render_single_instance_stack(deal_df, _pub_deal_label, where_sql, params, "pub_deal")
+
+        st.subheader("Breakout: impression share, avg bid, kill %, floor price by deal")
+        st.dataframe(
+            deal_df[["Deal_ID", "Category", "Floor_Price", "Impressions", "Impression_Share_Pct",
+                     "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+            use_container_width=True, hide_index=True,
+        )
+
+# ══════════════════════════════════════════════════════════════════════════
+# DEAL VIEW
+# ══════════════════════════════════════════════════════════════════════════
+
+elif view == "Deal View":
+    if not st.session_state.drill_deal:
+        st.subheader("Deals (aggregated across whatever line items carry them)")
+        deal_df = entity_summary(
+            ["Deal_ID"], where_sql, params, min_impressions, impressions_op=impressions_op,
+            extra_select="mode(Publisher) AS Publisher, mode(Category) AS Category, arg_max(Floor_Price, Run_Date) AS Floor_Price,",
+        )
+        clicked = render_aggregate_stack(deal_df, "Deal_ID", "deal_top", where_sql, params)
+        if clicked:
+            st.session_state.drill_deal = clicked
+            st.rerun()
+
+        st.subheader("Breakout: impressions and avg bid by deal")
+        st.dataframe(
+            deal_df[["Deal_ID", "Publisher", "Category", "Floor_Price", "Impressions",
+                     "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+            use_container_width=True, hide_index=True,
+        )
+    else:
+        deal_id = st.session_state.drill_deal
+        if st.button("⬅ Back to deals"):
+            st.session_state.drill_deal = None
+            st.rerun()
+        st.subheader(f"Deal {deal_id} — broken out by line item")
+        deal_where = where_sql + " AND Deal_ID = ?"
+        deal_params = params + [deal_id]
+
+        li_df = entity_summary(
+            ["BW_Line_Item_ID"], deal_where, deal_params, min_impressions, impressions_op=impressions_op,
+            extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
+                          "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
+        )
+        li_df["Deal_ID"] = deal_id
+        render_single_instance_stack(
+            li_df,
+            lambda ent: f"**{safe_label([ent['Line_Item_Name']], ent['BW_Line_Item_ID'])}**\n\nBW {ent['BW_Line_Item_ID']} · SF {ent['SF_Line_Item_ID']}",
+            where_sql, params, "deal_li",
+        )
+
+        st.subheader("Breakout: impression share by line item")
+        st.dataframe(
+            li_df[["Line_Item_Name", "BW_Line_Item_ID", "SF_Line_Item_ID", "Impressions",
+                   "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+            use_container_width=True, hide_index=True,
+        )
+
+# ══════════════════════════════════════════════════════════════════════════
+# TOTAL
+# ══════════════════════════════════════════════════════════════════════════
+
+else:
+    st.subheader("Total: actual clearing CPM & avg bid by day, across all lines and deals")
+    total_daily = daily_totals(where_sql, params)
+    total_chart = chart_aggregate(total_daily, height=200)
+    if total_chart is not None:
+        st.altair_chart(total_chart, use_container_width=True, theme=None)
+    else:
+        st.info("No rows match the current filters.")
+
+    st.subheader("Totals by line item")
+    li_total = entity_summary(
+        ["BW_Line_Item_ID"], where_sql, params, min_impressions, impressions_op=impressions_op,
+        extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
+                      "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
+    )
+    st.dataframe(
+        li_total[["Line_Item_Name", "BW_Line_Item_ID", "SF_Line_Item_ID", "Impressions",
+                  "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+        use_container_width=True, hide_index=True,
+    )
+
+    st.subheader("Totals by publisher")
+    pub_total = entity_summary(
+        ["Publisher"], where_sql, params, min_impressions, impressions_op=impressions_op, extra_select="mode(Category) AS Category,",
+    )
+    st.dataframe(
+        pub_total[["Publisher", "Category", "Impressions", "Impression_Share_Pct",
+                   "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+        use_container_width=True, hide_index=True,
+    )
+
+    st.subheader("Totals by deal")
+    deal_total = entity_summary(
+        ["Deal_ID"], where_sql, params, min_impressions, impressions_op=impressions_op,
+        extra_select="mode(Publisher) AS Publisher, mode(Category) AS Category, arg_max(Floor_Price, Run_Date) AS Floor_Price,",
+    )
+    st.dataframe(
+        deal_total[["Deal_ID", "Publisher", "Category", "Floor_Price", "Impressions",
+                    "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+        use_container_width=True, hide_index=True,
+    )
+
+# Decision reason breakdown + glossary -- on every view, per request.
+render_reason_footer(where_sql, params)

@@ -40,6 +40,7 @@ DEFAULT_RAW_KEEP_DAYS = 14
 DASHBOARD_COLUMNS = [
     "SF_Line_Item_ID",
     "BW_Line_Item_ID",
+    "Line_Item_Name",
     "Publisher",
     "Deal_ID",
     "CPM_Bid",
@@ -49,7 +50,18 @@ DASHBOARD_COLUMNS = [
     "Effective_Bid_Current",
     "Effective_Bid_New",
     "Decision_Reason",
+    "Targets_537",
+    "_Included_Deal_Lists",
 ]
+
+# 04_bid_optimizer.parquet's leading-underscore columns are its own "internal"
+# naming convention -- stripped here since this file is a public dashboard
+# schema, not an internal pipeline artifact.
+DASHBOARD_COLUMN_RENAMES = {"_Included_Deal_Lists": "Included_Deal_Lists"}
+
+# Columns sourced from the paired `_full` run's 03b_deal_performance_1day.parquet
+# (see _load_deal_performance_1day) rather than 04_bid_optimizer.parquet.
+DEAL_PERF_COLUMNS = ["Deal_Impressions_1Day", "Deal_Spend_1Day_USD"]
 
 DEDUPE_KEYS = ["Run_Date", "BW_Line_Item_ID", "Deal_ID"]
 
@@ -149,8 +161,69 @@ def _run_date_str(run_dir: Path) -> str:
     raise ValueError(f"Could not determine run date for {run_dir}")
 
 
+def _find_full_run_for_date(date_str: str) -> Optional[Path]:
+    """Latest successful `_full` run folder for a given date.
+
+    03b_deal_performance_1day.parquet only ever lands in a `_full` run folder —
+    `run_pushonly` (sbo/pipeline.py) only ever copies 04_bid_optimizer.parquet
+    forward into its own folder, so the pushonly folder `load_run_slice` is
+    normally handed can't supply it. We look up that date's `_full` run
+    separately instead.
+    """
+    if not RUNS_DIR.exists():
+        return None
+    candidates = []
+    for entry in RUNS_DIR.iterdir():
+        if not entry.is_dir():
+            continue
+        parsed = _parse_run_folder(entry)
+        if not parsed or parsed["phase"] != "full" or parsed["date"] != date_str:
+            continue
+        if not _run_status_ok(entry):
+            continue
+        candidates.append(parsed)
+    if not candidates:
+        return None
+    candidates.sort(key=lambda c: c["time"])
+    return candidates[-1]["path"]
+
+
+def _load_deal_performance_1day(full_run_dir: Path) -> pd.DataFrame:
+    """Read that day's actual deal-level impressions/spend, if present.
+
+    The 1-day Beeswax fetch is itself non-critical in the pipeline (see
+    full_report_mp_ctv.py) — it can be legitimately absent if it errored that
+    day. Returns an empty frame with the right columns rather than raising, so
+    a missing fetch degrades to blank stats instead of breaking the whole
+    day's history append.
+    """
+    cols = ["BW_Line_Item_ID", "Deal_ID"] + DEAL_PERF_COLUMNS
+    path = full_run_dir / "03b_deal_performance_1day.parquet" if full_run_dir else None
+    if path is None or not path.exists():
+        return pd.DataFrame(columns=cols)
+    df = pd.read_parquet(path)
+    if df.empty or "line_item_id" not in df.columns or "deal_id" not in df.columns:
+        return pd.DataFrame(columns=cols)
+    out = pd.DataFrame({
+        "BW_Line_Item_ID": df["line_item_id"].astype(str).str.strip(),
+        "Deal_ID": df["deal_id"].astype(str).str.strip(),
+        "Deal_Impressions_1Day": pd.to_numeric(df.get("impression"), errors="coerce"),
+        "Deal_Spend_1Day_USD": pd.to_numeric(df.get("media_spend_usd"), errors="coerce"),
+    })
+    # Defensive: collapse to one row per (LI, deal) in case the report ever
+    # returns split rows (e.g. by alternative_id) for the same pair.
+    return out.groupby(["BW_Line_Item_ID", "Deal_ID"], as_index=False).sum()
+
+
 def load_run_slice(run_dir: Path) -> pd.DataFrame:
-    """Read 04_bid_optimizer.parquet, select dashboard columns, stamp Run_Date."""
+    """Read 04_bid_optimizer.parquet, select dashboard columns, stamp Run_Date.
+
+    Full-outer-joins in that day's actual deal-level impressions/spend (from
+    the paired `_full` run's 03b_deal_performance_1day.parquet). Deals with
+    real spend that day but no bid-decision row are kept, with the bid-side
+    columns left NULL, rather than dropped — a deal delivering without an
+    active decision is a real anomaly worth surfacing, not noise to hide.
+    """
     parquet_path = run_dir / "04_bid_optimizer.parquet"
     if not parquet_path.exists():
         raise FileNotFoundError(f"No 04_bid_optimizer.parquet in {run_dir}")
@@ -158,8 +231,16 @@ def load_run_slice(run_dir: Path) -> pd.DataFrame:
     missing = [c for c in DASHBOARD_COLUMNS if c not in df.columns]
     if missing:
         raise ValueError(f"{run_dir} missing expected columns: {missing}")
-    out = df[DASHBOARD_COLUMNS].copy()
-    out.insert(0, "Run_Date", _run_date_str(run_dir))
+    bid = df[DASHBOARD_COLUMNS].copy().rename(columns=DASHBOARD_COLUMN_RENAMES)
+    bid["BW_Line_Item_ID"] = bid["BW_Line_Item_ID"].astype(str).str.strip()
+    bid["Deal_ID"] = bid["Deal_ID"].astype(str).str.strip()
+
+    run_date = _run_date_str(run_dir)
+    full_run_dir = _find_full_run_for_date(run_date)
+    deal_perf = _load_deal_performance_1day(full_run_dir)
+
+    out = bid.merge(deal_perf, on=["BW_Line_Item_ID", "Deal_ID"], how="outer")
+    out.insert(0, "Run_Date", run_date)
     return out
 
 
@@ -170,7 +251,8 @@ def load_run_slice(run_dir: Path) -> pd.DataFrame:
 
 def _read_live_file() -> pd.DataFrame:
     if not LIVE_FILE.exists():
-        return pd.DataFrame(columns=["Run_Date"] + DASHBOARD_COLUMNS)
+        renamed_cols = [DASHBOARD_COLUMN_RENAMES.get(c, c) for c in DASHBOARD_COLUMNS]
+        return pd.DataFrame(columns=["Run_Date"] + renamed_cols + DEAL_PERF_COLUMNS)
     return pd.read_csv(LIVE_FILE, compression="gzip", dtype=str)
 
 
