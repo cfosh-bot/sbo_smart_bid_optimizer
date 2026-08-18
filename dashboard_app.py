@@ -523,7 +523,7 @@ def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
             daily = batch[batch["Entity_ID"] == eid] if not batch.empty else pd.DataFrame()
             chart = chart_aggregate(daily, show_pacing_labels=show_pacing_labels)
             if chart is not None:
-                st.altair_chart(chart, use_container_width=True, theme=None)
+                st.altair_chart(chart, width='stretch', theme=None)
             else:
                 st.caption("No daily delivery data for this entity in range.")
     return clicked
@@ -550,7 +550,7 @@ def render_single_instance_stack(entities: pd.DataFrame, label_fn, where_sql: st
             daily = batch[(batch["BW_Line_Item_ID"] == li_id) & (batch["Deal_ID"] == deal_id)] if not batch.empty else pd.DataFrame()
             chart = chart_single_instance(daily, show_pacing_labels=show_pacing_labels)
             if chart is not None:
-                st.altair_chart(chart, use_container_width=True, theme=None)
+                st.altair_chart(chart, width='stretch', theme=None)
             else:
                 st.caption("No daily delivery data for this pair in range.")
 
@@ -582,7 +582,7 @@ def render_reason_footer(where_sql: str, params: list):
 
     st.caption("Reason code library")
     glossary_df = pd.DataFrame(REASON_CODE_GLOSSARY.items(), columns=["Code", "Meaning"])
-    st.dataframe(glossary_df, use_container_width=True, hide_index=True)
+    st.dataframe(glossary_df, width='stretch', hide_index=True)
 
 
 # ── page setup ────────────────────────────────────────────────────────────
@@ -606,7 +606,12 @@ with f2:
     with i1:
         impressions_op = st.selectbox("Impressions", IMPRESSIONS_OPERATORS, index=0, label_visibility="visible")
     with i2:
-        min_impressions = st.number_input("Total impressions in range (per entity)", min_value=0, value=0, step=100)
+        min_impressions = st.number_input(
+            "Total impressions in range (per entity)", min_value=0, value=250_000, step=10_000,
+            help="Defaults to 250,000, not 0 -- the droplet has 961MB RAM, and rendering all "
+                 "~860 line items at once (the count at 0) is what made the first deploy hang. "
+                 "Set to 0 deliberately if you want everything, but expect it to be slow there.",
+        )
 
 f3, f4 = st.columns(2)
 with f3:
@@ -709,7 +714,7 @@ if view == "Line Item View":
         st.dataframe(
             deal_df[["Publisher", "Category", "Deal_ID", "Floor_Price", "Impressions", "Impression_Share_Pct",
                      "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -732,7 +737,7 @@ elif view == "Publisher View":
         st.dataframe(
             pub_df[["Publisher", "Category", "Impressions", "Impression_Share_Pct",
                     "Actual_Clearing_CPM", "Avg_Bid", "Pct_Killed"]],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
     else:
         pub = st.session_state.drill_pub
@@ -764,7 +769,7 @@ elif view == "Publisher View":
         st.dataframe(
             deal_df[["Deal_ID", "Category", "Floor_Price", "Impressions", "Impression_Share_Pct",
                      "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -787,7 +792,7 @@ elif view == "Deal View":
         st.dataframe(
             deal_df[["Deal_ID", "Publisher", "Category", "Floor_Price", "Impressions",
                      "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
     else:
         deal_id = st.session_state.drill_deal
@@ -814,7 +819,7 @@ elif view == "Deal View":
         st.dataframe(
             li_df[["Line_Item_Name", "BW_Line_Item_ID", "SF_Line_Item_ID", "Impressions",
                    "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
-            use_container_width=True, hide_index=True,
+            width='stretch', hide_index=True,
         )
 
 # ══════════════════════════════════════════════════════════════════════════
@@ -826,7 +831,7 @@ else:
     total_daily = daily_totals(where_sql, params)
     total_chart = chart_aggregate(total_daily, height=200)
     if total_chart is not None:
-        st.altair_chart(total_chart, use_container_width=True, theme=None)
+        st.altair_chart(total_chart, width='stretch', theme=None)
     else:
         st.info("No rows match the current filters.")
 
@@ -839,7 +844,7 @@ else:
     st.dataframe(
         li_total[["Line_Item_Name", "BW_Line_Item_ID", "SF_Line_Item_ID", "Impressions",
                   "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
     )
 
     st.subheader("Totals by publisher")
@@ -849,7 +854,7 @@ else:
     st.dataframe(
         pub_total[["Publisher", "Category", "Impressions", "Impression_Share_Pct",
                    "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
     )
 
     st.subheader("Totals by deal")
@@ -860,7 +865,7 @@ else:
     st.dataframe(
         deal_total[["Deal_ID", "Publisher", "Category", "Floor_Price", "Impressions",
                     "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
-        use_container_width=True, hide_index=True,
+        width='stretch', hide_index=True,
     )
 
 # Decision reason breakdown + glossary -- on every view, per request.
