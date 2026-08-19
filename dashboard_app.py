@@ -84,7 +84,7 @@ IS_KILLED_EXPR = f"({REASON_CODE_EXPR} IN ({_KILL_LIST_SQL}))"
 # actual Decision_Reason text seen in the data -- not guessed. Worth a sanity
 # check against the pipeline if any of these look off.
 REASON_CODE_GLOSSARY = {
-    "PACE_HOLD_ONTARGET": "Pacing on target (100-105%) -- no bid adjustment",
+    "PACE_HOLD_ONTARGET": "Pacing on target (95-105%) -- no bid adjustment",
     "PACE_UP_AGG": "Behind pace -- aggressive bid increase",
     "PACE_UP_MOD": "Behind pace -- moderate bid increase",
     "PACE_UP_CRITICAL": "Significantly behind pace -- maximum bid increase",
