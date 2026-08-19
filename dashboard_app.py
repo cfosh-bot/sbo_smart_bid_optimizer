@@ -149,7 +149,13 @@ def get_connection():
 con = get_connection()
 
 
+@st.cache_data(ttl=600, show_spinner=False)
 def q(sql: str, params=None) -> pd.DataFrame:
+    """Every entity list, chart batch, and breakout table funnels through
+    here, so caching at this single choke point is what makes flipping back
+    to a view you already opened (same filters, same drill-down) instant
+    instead of re-hitting DuckDB -- at the cost of results going stale for
+    up to 10 minutes after the daily pipeline appends a new row."""
     try:
         result = con.execute(sql, params or []).fetchdf()
         return result if result is not None else pd.DataFrame()
@@ -532,7 +538,8 @@ def reset_pagination_if_changed(signature: str):
 
 
 def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
-                            where_sql: str, params: list, show_pacing_labels: bool = False):
+                            where_sql: str, params: list, show_pacing_labels: bool = False,
+                            share_pct_label: bool = False):
     """Stacked list of aggregate-style charts (LI / publisher / deal-view-top).
     Returns the id clicked this run, or None."""
     if entities.empty:
@@ -564,7 +571,16 @@ def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
                 if pd.notna(name):
                     st.caption(str(name))
                 sf = ent.get("SF_Line_Item_ID")
-                st.caption(" · ".join(x for x in [f"SF {sf}" if pd.notna(sf) else "", imps_text, cpm_text] if x))
+                # Within a publisher's own line-item breakdown, share of that
+                # publisher's impressions is more useful than a raw count --
+                # the count alone doesn't say whether this LI is 2% or 80% of
+                # what the publisher delivers.
+                vol_text = (
+                    f"{ent['Impression_Share_Pct']:.1f}% of impressions"
+                    if share_pct_label and pd.notna(ent.get("Impression_Share_Pct"))
+                    else imps_text
+                )
+                st.caption(" · ".join(x for x in [f"SF {sf}" if pd.notna(sf) else "", vol_text, cpm_text] if x))
             elif id_col == "Publisher":
                 st.markdown(f"#### {eid}")
                 cat = ent.get("Category")
@@ -593,7 +609,8 @@ def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
 
 
 def render_single_instance_stack(entities: pd.DataFrame, label_fn, where_sql: str, params: list,
-                                  key_prefix: str, show_pacing_labels: bool = False):
+                                  key_prefix: str, show_pacing_labels: bool = False,
+                                  share_pct: bool = False):
     """Stacked list of single-(line item, deal)-instance charts, e.g. the deals
     under one line item/publisher, or the line items carrying one isolated deal.
 
@@ -619,7 +636,10 @@ def render_single_instance_stack(entities: pd.DataFrame, label_fn, where_sql: st
             for g in greys:
                 if g:
                     st.caption(g)
-            st.caption(f"{safe_int(ent['Impressions']):,} imps")
+            if share_pct and pd.notna(ent.get("Impression_Share_Pct")):
+                st.caption(f"{ent['Impression_Share_Pct']:.1f}% of impressions")
+            else:
+                st.caption(f"{safe_int(ent['Impressions']):,} imps")
         with right:
             daily = batch[(batch["BW_Line_Item_ID"] == li_id) & (batch["Deal_ID"] == deal_id)] if not batch.empty else pd.DataFrame()
             chart = chart_single_instance(daily, show_pacing_labels=show_pacing_labels)
@@ -740,8 +760,26 @@ reset_pagination_if_changed(
 )
 
 # ── header stats ─────────────────────────────────────────────────────────
+# Scoped to whatever the user is currently drilled into -- otherwise these
+# numbers stay pinned to the page-wide total even while looking at one
+# publisher's or one deal's slice, which reads as broken.
 
-overview = q(f"SELECT COUNT(*) AS rows, {AGG_SELECT} FROM history WHERE {where_sql}", params)
+if view == "Line Item View" and st.session_state.drill_li:
+    scope_where = where_sql + " AND BW_Line_Item_ID = ?"
+    scope_params = params + [st.session_state.drill_li]
+elif view == "Publisher View" and st.session_state.drill_pub_li:
+    scope_where = where_sql + " AND Publisher = ? AND BW_Line_Item_ID = ?"
+    scope_params = params + [st.session_state.drill_pub, st.session_state.drill_pub_li]
+elif view == "Publisher View" and st.session_state.drill_pub:
+    scope_where = where_sql + " AND Publisher = ?"
+    scope_params = params + [st.session_state.drill_pub]
+elif view == "Deal View" and st.session_state.drill_deal:
+    scope_where = where_sql + " AND Deal_ID = ?"
+    scope_params = params + [st.session_state.drill_deal]
+else:
+    scope_where, scope_params = where_sql, params
+
+overview = q(f"SELECT COUNT(*) AS rows, {AGG_SELECT} FROM history WHERE {scope_where}", scope_params)
 
 m1, m2, m3, m4, m5 = st.columns(5)
 if not overview.empty:
@@ -839,7 +877,8 @@ elif view == "Publisher View":
             extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
                           "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
         )
-        clicked = render_aggregate_stack(li_df, "BW_Line_Item_ID", "pub_li", pub_where, pub_params)
+        clicked = render_aggregate_stack(li_df, "BW_Line_Item_ID", "pub_li", pub_where, pub_params,
+                                          share_pct_label=True)
         if clicked:
             st.session_state.drill_pub_li = clicked
             st.rerun()
@@ -921,10 +960,15 @@ elif view == "Deal View":
         render_single_instance_stack(
             li_df,
             lambda ent: (
-                safe_label([ent["Line_Item_Name"]], ent["BW_Line_Item_ID"]),
-                [_floor_text(ent), f"BW {ent['BW_Line_Item_ID']} · SF {ent['SF_Line_Item_ID']}"],
+                ent["BW_Line_Item_ID"],
+                [
+                    str(ent["Line_Item_Name"]) if pd.notna(ent.get("Line_Item_Name")) else "",
+                    _floor_text(ent),
+                    f"SF {ent['SF_Line_Item_ID']}",
+                ],
             ),
             where_sql, params, "deal_li",
+            share_pct=True,
         )
 
         st.subheader("Breakout: impression share by line item")
