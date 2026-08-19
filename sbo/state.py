@@ -42,8 +42,10 @@ class StateStore:
         "paused_snapshot": ("paused_snapshot.parquet", ["BW_Line_Item_ID", "Deal_ID", "Paused_Date", "Held_Multiplier", "Basis"]),
         "kill_log": ("kill_log.parquet", KILL_LOG_COLS),
         "category_cpm_history": ("category_cpm_history.parquet", CATEGORY_CPM_COLS),
-        # MP CTV-specific CPM history logs
-        "deal_cpm_history": ("deal_cpm_history.parquet", ["Deal_ID", "Deal_Category", "Floor_Price", "Global_Clearing_CPM", "Last_Updated"]),
+        # MP CTV-specific CPM history logs. Publisher added 2026-08-19 —
+        # this file doubles as the Publisher/Category/Floor fallback log for
+        # deals with no ATR delivery history on a given LI (see bid_optimizer.py).
+        "deal_cpm_history": ("deal_cpm_history.parquet", ["Deal_ID", "Deal_Category", "Floor_Price", "Global_Clearing_CPM", "Last_Updated", "Publisher"]),
         "publisher_cpm_history": ("publisher_cpm_history.parquet", ["Publisher", "Global_Clearing_CPM", "Last_Updated"]),
         # pacing_history is wide-format (cols = recent dates) — handled separately
     }

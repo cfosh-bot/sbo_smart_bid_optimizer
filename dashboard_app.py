@@ -853,7 +853,7 @@ elif view == "Publisher View":
         st.subheader("Publishers")
         pub_df = entity_summary(
             ["Publisher"], where_sql, params, min_impressions, impressions_op=impressions_op,
-            extra_select="mode(Category) AS Category,",
+            extra_select="arg_max(Category, Run_Date) AS Category,",
         )
         clicked = render_aggregate_stack(pub_df, "Publisher", "pub", where_sql, params)
         if clicked:
@@ -942,7 +942,7 @@ elif view == "Deal View":
         st.subheader("Deals (aggregated across whatever line items carry them)")
         deal_df = entity_summary(
             ["Deal_ID"], where_sql, params, min_impressions, impressions_op=impressions_op,
-            extra_select="mode(Publisher) AS Publisher, mode(Category) AS Category, arg_max(Floor_Price, Run_Date) AS Floor_Price,",
+            extra_select="arg_max(Publisher, Run_Date) AS Publisher, arg_max(Category, Run_Date) AS Category, arg_max(Floor_Price, Run_Date) AS Floor_Price,",
         )
         clicked = render_aggregate_stack(deal_df, "Deal_ID", "deal_top", where_sql, params)
         if clicked:
@@ -1020,7 +1020,7 @@ else:
 
     st.subheader("Totals by publisher")
     pub_total = entity_summary(
-        ["Publisher"], where_sql, params, min_impressions, impressions_op=impressions_op, extra_select="mode(Category) AS Category,",
+        ["Publisher"], where_sql, params, min_impressions, impressions_op=impressions_op, extra_select="arg_max(Category, Run_Date) AS Category,",
     )
     st.dataframe(
         pub_total[["Publisher", "Category", "Impressions", "Impression_Share_Pct",
@@ -1031,7 +1031,7 @@ else:
     st.subheader("Totals by deal")
     deal_total = entity_summary(
         ["Deal_ID"], where_sql, params, min_impressions, impressions_op=impressions_op,
-        extra_select="mode(Publisher) AS Publisher, mode(Category) AS Category, arg_max(Floor_Price, Run_Date) AS Floor_Price,",
+        extra_select="arg_max(Publisher, Run_Date) AS Publisher, arg_max(Category, Run_Date) AS Category, arg_max(Floor_Price, Run_Date) AS Floor_Price,",
     )
     st.dataframe(
         deal_total[["Deal_ID", "Publisher", "Category", "Floor_Price", "Impressions",

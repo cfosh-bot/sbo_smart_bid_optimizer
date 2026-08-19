@@ -135,7 +135,7 @@ def build_full_report_mp_ctv(
     run.log(f"Publisher stats built: {len(pub_stats):,} rows")
 
     # 8. Upsert Deal + Publisher CPM history
-    _upsert_deal_cpm_history(state, atr, deal_to_category, floor_prices)
+    _upsert_deal_cpm_history(state, atr, deal_to_category, floor_prices, pub_stats)
     _upsert_publisher_cpm_history(state, atr, pub_name_to_list)
 
     run.log("=== build_full_report_mp_ctv complete ===")
@@ -371,16 +371,38 @@ def _build_publisher_stats_mp_ctv(
 # ── state: CPM history upserts ────────────────────────────────────────────
 
 
+def _modal_first_on_tie(values: List[str]) -> str:
+    """Most frequent value in `values`; ties broken by whichever appeared
+    first. Guards a deal_id that (shouldn't, but could) come back with more
+    than one parsed publisher name in a single pull."""
+    seen_order: List[str] = []
+    counts: Dict[str, int] = {}
+    for v in values:
+        if v not in counts:
+            counts[v] = 0
+            seen_order.append(v)
+        counts[v] += 1
+    return max(seen_order, key=lambda v: counts[v])
+
+
 def _upsert_deal_cpm_history(
     state: StateStore,
     atr: pd.DataFrame,
     deal_to_category: Dict[str, str],
     floor_prices: pd.DataFrame,
+    pub_stats: pd.DataFrame,
 ) -> None:
     """Daily upsert of deal-level global clearing CPM.
 
     Mirrors sboUpsertDealCpmLog_ from MP CTV Apps Script.
-    Columns: Deal_ID | Deal_Category | Floor_Price | Global_Clearing_CPM | Last_Updated
+    Columns: Deal_ID | Deal_Category | Floor_Price | Global_Clearing_CPM | Last_Updated | Publisher
+
+    2026-08-19: added Publisher. This file doubles as the fallback log
+    bid_optimizer.py reads from for deals with no ATR delivery history on a
+    given LI (so they'd otherwise show blank Publisher/Category/Floor and be
+    invisible to the pub/category cap rules). "Latest run wins" upsert below
+    already matches the requirement that a later day's different mapping for
+    a deal replaces the old one.
     """
     if atr.empty:
         return
@@ -394,6 +416,11 @@ def _upsert_deal_cpm_history(
         floor_prices.set_index("deal_id")["floor_price"].to_dict()
         if not floor_prices.empty else {}
     )
+    pub_map: Dict[str, str] = {}
+    if not pub_stats.empty and "Publisher" in pub_stats.columns and "Deal_ID" in pub_stats.columns:
+        nonblank = pub_stats[pub_stats["Publisher"].astype(str).str.strip() != ""]
+        for deal_id, grp in nonblank.groupby("Deal_ID")["Publisher"]:
+            pub_map[str(deal_id)] = _modal_first_on_tie(grp.tolist())
     today = datetime.now().isoformat(timespec="seconds")
     new_rows = pd.DataFrame({
         "Deal_ID":              deal_agg["deal_id"].astype(str),
@@ -401,6 +428,7 @@ def _upsert_deal_cpm_history(
         "Floor_Price":          pd.to_numeric(deal_agg["deal_id"].map(fp_map), errors="coerce"),
         "Global_Clearing_CPM":  deal_agg["Global_Clearing_CPM"],
         "Last_Updated":         today,
+        "Publisher":            deal_agg["deal_id"].astype(str).map(pub_map).fillna(""),
     })
     existing = state.load("deal_cpm_history") if hasattr(state, "load") else pd.DataFrame()
     if not existing.empty and "Deal_ID" in existing.columns:

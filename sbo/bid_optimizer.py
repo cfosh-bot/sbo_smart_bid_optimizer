@@ -244,6 +244,27 @@ def pull_bid_modifiers(
     # 8. Group publisher_stats by (LI, deal) for quick lookup
     ps_lookup = _publisher_stats_lookup(publisher_stats)
     last3_map = dict(zip(last3_cpm["line_item_id"], last3_cpm["last_3_days_cpm"]))
+
+    # 8b. MP CTV only — fallback map for deals with no ATR delivery history on
+    # this specific LI (so ps_lookup misses them): pull Publisher/Category/
+    # Floor from the persistent deal_cpm_history log instead of leaving them
+    # blank. When falling back, also inherit that publisher's/category's
+    # already-computed share % from any OTHER deal on this LI that's in the
+    # same group, so cap rules treat this deal as already belonging to that
+    # group rather than as invisible/uncapped.
+    fallback_map: Dict[str, Dict[str, Any]] = {}
+    pub_share_lookup: Dict[tuple[str, str], Dict[str, Any]] = {}
+    cat_share_lookup: Dict[tuple[str, str], Dict[str, Any]] = {}
+    if cfg.is_mp_ctv:
+        fallback_map = _deal_fallback_map(state)
+        pub_share_lookup = _group_share_lookup(
+            publisher_stats, "Publisher",
+            ["Pub_Impression_Share_Pct", "Pub_Clearing_CPM_On_LI", "Pub_Global_Clearing_CPM"],
+        )
+        cat_share_lookup = _group_share_lookup(
+            publisher_stats, "Deal_Category",
+            ["Category_Impression_Share_Pct", "Category_Clearing_CPM_On_LI", "Category_Global_Clearing_CPM"],
+        )
     deal_to_sub_tactic = deal_to_sub_tactic or {}
     _deal_to_mod = deal_to_mod_type or {}
 
@@ -290,6 +311,32 @@ def pull_bid_modifiers(
             for li_id in target_li_ids:
                 ps_row = ps_lookup.get((li_id, deal_id), {})
                 raw_floor = bid_opt_floor_prices.get(deal_id, "")
+
+                if cfg.is_mp_ctv:
+                    fb = fallback_map.get(deal_id, {})
+                    # No ATR row for this (LI, deal) at all -- backfill
+                    # Publisher/Category from the log, and inherit that
+                    # group's already-computed share % from any other deal
+                    # on this LI in the same group (falls back to 0% if
+                    # this is the only deal in that group on this LI, which
+                    # is correct -- it genuinely isn't over any cap yet).
+                    if not ps_row and fb:
+                        ps_row = dict(ps_row)
+                        fb_pub = fb.get("Publisher")
+                        fb_cat = fb.get("Deal_Category")
+                        if fb_pub:
+                            ps_row["Publisher"] = fb_pub
+                            ps_row.update(pub_share_lookup.get((li_id, fb_pub), {}))
+                        if fb_cat:
+                            ps_row["Deal_Category"] = fb_cat
+                            ps_row.update(cat_share_lookup.get((li_id, fb_cat), {}))
+                    # Today's deal_agg pull came back blank for this deal --
+                    # reuse the last known real floor instead of leaving it
+                    # blank (which would otherwise fall through to the
+                    # multiplier engine's rougher same-day floor estimate).
+                    if raw_floor in ("", None) and fb.get("Floor_Price") is not None:
+                        raw_floor = fb["Floor_Price"]
+
                 # Apply 1.07 fee multiplier exactly once here (matches Apps Script)
                 floor_str = ""
                 if raw_floor not in ("", None):
@@ -532,6 +579,53 @@ def _publisher_stats_lookup(
     df = publisher_stats.drop_duplicates(subset=["Line_Item_ID", "Deal_ID"], keep="first")
     return {
         (str(r["Line_Item_ID"]), str(r["Deal_ID"])): r.to_dict()
+        for _, r in df.iterrows()
+    }
+
+
+def _deal_fallback_map(state: StateStore) -> Dict[str, Dict[str, Any]]:
+    """Deal_ID -> {Publisher, Deal_Category, Floor_Price} from the persistent
+    deal_cpm_history log, for deals this run's ATR has no delivery history
+    for. Blank/NaN fields are omitted so callers naturally fall through to
+    their own "" default rather than overwriting it with an empty string."""
+    log = state.load("deal_cpm_history")
+    if log.empty or "Deal_ID" not in log.columns:
+        return {}
+    out: Dict[str, Dict[str, Any]] = {}
+    for _, r in log.iterrows():
+        deal_id = str(r["Deal_ID"]).strip()
+        if not deal_id:
+            continue
+        entry = {}
+        pub = r.get("Publisher")
+        if pd.notna(pub) and str(pub).strip():
+            entry["Publisher"] = str(pub).strip()
+        cat = r.get("Deal_Category")
+        if pd.notna(cat) and str(cat).strip():
+            entry["Deal_Category"] = str(cat).strip()
+        floor = r.get("Floor_Price")
+        if pd.notna(floor):
+            entry["Floor_Price"] = float(floor)
+        if entry:
+            out[deal_id] = entry
+    return out
+
+
+def _group_share_lookup(
+    publisher_stats: pd.DataFrame, group_col: str, share_cols: List[str],
+) -> Dict[tuple[str, str], Dict[str, Any]]:
+    """(line_item_id, group value) -> first matching row's share/CPM columns.
+
+    Lets a fallback-mapped deal (no publisher_stats row of its own) inherit
+    the already-computed share % of whatever publisher/category it's mapped
+    to, from any OTHER deal on the same LI that's actually in that group.
+    """
+    if publisher_stats.empty or group_col not in publisher_stats.columns:
+        return {}
+    df = publisher_stats[publisher_stats[group_col].astype(str).str.strip() != ""]
+    df = df.drop_duplicates(subset=["Line_Item_ID", group_col], keep="first")
+    return {
+        (str(r["Line_Item_ID"]), str(r[group_col])): {c: r.get(c) for c in share_cols}
         for _, r in df.iterrows()
     }
 
