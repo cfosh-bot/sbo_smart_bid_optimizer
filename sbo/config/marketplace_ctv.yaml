@@ -84,6 +84,33 @@ price_tier:
 pub_cap_537: 0.20    # OPT_PUB_CAP_537   — cap for 537-targeted lines
 pub_cap_other: 0.40  # OPT_PUB_CAP_OTHER — cap for all other lines
 
+# Pacing step size, as a % of floor price — replaces the old flat multiplier
+# deltas (0.10/0.15/0.20/etc). 2026-08-19 pacing-rules follow-up w/ Casey:
+# the "regular" (mod) step for both pace-up and pace-down is 3.8% of floor;
+# every other band's ratio to that 3.8% base is identical to the old ratio
+# each band's flat constant had to the old 0.10 baseline. Every OTHER
+# multiplier (hist_trend, price tier, EOC boost, day_mod, max_single_day_down,
+# all ceilings/floors) is unchanged — only this starting value moved from a
+# flat number to floor_price × pct.
+# 2026-08-19 follow-up: the ≤7d and ≤3d bands now reuse the 8-14d percentages
+# (5.7/9.5/13.3%) instead of their own 3.8/7.6/11.4% — only the boost
+# multiplier applied on top still differs between them (see last3_boost).
+pace_step_pct:
+  up_gt14d:  {mod: 0.038, agg: 0.076, critical: 0.114}  # >14 days remaining
+  up_8_14d:  {mod: 0.057, agg: 0.095, critical: 0.133}  # 8-14 days remaining
+  up_le7d:   {mod: 0.057, agg: 0.095, critical: 0.133}  # 4-7 days (≤3d is its own Priority-1 branch, up_le3d below)
+  up_le3d:   {mod: 0.057, agg: 0.095, critical: 0.133}  # LAST_3_DAYS_UNDER
+  down:      {mod: 0.038, agg: 0.057, critical: 0.076}  # 105-115% / 115-125% / ≥125% pacing
+
+# Boost multiplier applied on top of pace_step_pct.up_le3d only
+# (LAST_3_DAYS_UNDER) — replaces the old EOC boost (1.10/1.20/1.30) with a
+# stronger set per the 2026-08-19 follow-up, since 3 days left is more urgent
+# than 7.
+last3_boost:
+  mod: 1.3
+  agg: 1.4
+  critical: 1.5
+
 # Category impression share caps (537-targeted lines only)
 cat_cap_over: 0.25   # OPT_CAT_CAP_OVER  — throttle entry when overpacing
 cat_cap_under: 0.30  # OPT_CAT_CAP_UNDER — throttle entry when underpacing

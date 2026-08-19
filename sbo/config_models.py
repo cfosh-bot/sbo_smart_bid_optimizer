@@ -88,6 +88,29 @@ class PriceTierBlock(BaseModel):
     up_sev_min: float
 
 
+class PaceStepPctBand(BaseModel):
+    """One pacing-severity band's step size, as a fraction of floor price."""
+    mod: float
+    agg: float
+    critical: float
+
+
+class PaceStepPctBlock(BaseModel):
+    """MP CTV only — pacing step size as % of floor price (2026-08-19)."""
+    up_gt14d: PaceStepPctBand
+    up_8_14d: PaceStepPctBand
+    up_le7d: PaceStepPctBand
+    up_le3d: PaceStepPctBand
+    down: PaceStepPctBand
+
+
+class Last3BoostBlock(BaseModel):
+    """MP CTV only — boost multiplier for LAST_3_DAYS_UNDER (2026-08-19)."""
+    mod: float
+    agg: float
+    critical: float
+
+
 class ApiBlock(BaseModel):
     chunk_size: int
     report_batch_size: int
@@ -149,6 +172,8 @@ class EngineConfig(BaseModel):
     cat_kill_over: float = 0.30
     marketplace_list_ids: List[str] = Field(default_factory=list)
     deal_537_id: str = "537"
+    pace_step_pct: Optional[PaceStepPctBlock] = None
+    last3_boost: Optional[Last3BoostBlock] = None
 
     # ── Select CTV-specific fields (optional so other tactics' YAMLs stay valid) ──
     margin_trim: Optional[MarginTrimBlock] = None

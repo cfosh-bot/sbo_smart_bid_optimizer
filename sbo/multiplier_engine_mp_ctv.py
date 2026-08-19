@@ -496,11 +496,13 @@ def _decide_one_mp_ctv(
                 f"holding {ctx.curr_mult:.3f}×. No decreases. Days left: {ctx.days_rem}."
             )
         else:
-            pacing = ctx.pacing
-            base_up   = 0.10 if pacing >= 0.90 else (0.20 if pacing >= 0.75 else 0.30)
-            eoc_boost = 1.10 if pacing >= 0.90 else (1.20 if pacing >= 0.75 else 1.30)
-            base_up   = base_up * eoc_boost * hist_trend
+            pacing    = ctx.pacing
             sev       = pacing < 0.75
+            band      = "critical" if sev else ("agg" if pacing < 0.90 else "mod")
+            step_pct  = getattr(cfg.pace_step_pct.up_le3d, band)
+            boost     = getattr(cfg.last3_boost, band)
+            base_up   = (effective_floor * step_pct) / ctx.cpm_bid
+            base_up   = base_up * boost * hist_trend
             tier_mod  = _price_tier_mod(ctx.rank_frac, "up_severe" if sev else "up_normal", cfg)
             total_up  = base_up * tier_mod
             start     = norm_min if ctx.curr_mult <= throttle_mult + 0.001 else ctx.curr_mult
@@ -509,8 +511,9 @@ def _decide_one_mp_ctv(
             reason_text = (
                 f"Last 3 days, underpacing {round(pacing * 100)}% — "
                 f"raise +{total_up:.3f} "
-                f"(base {0.10 if pacing >= 0.90 else (0.20 if pacing >= 0.75 else 0.30):.2f} "
-                f"× EOC {eoc_boost:.2f} × trend {hist_trend:.1f} × tier {tier_mod:.3f}). "
+                f"(floor ${effective_floor:.2f} × {step_pct * 100:.1f}% "
+                f"× boost {boost:.1f} × trend {hist_trend:.1f} × tier {tier_mod:.3f} "
+                f"/ cpm ${ctx.cpm_bid:.2f}). "
                 f"Days left: {ctx.days_rem}. {ctx.curr_mult:.3f} → {new_mult:.3f}."
             )
 
@@ -737,7 +740,7 @@ def _decide_one_mp_ctv(
         else:
             new_mult, reason_code, reason_text = _normal_pacing_mp_ctv(
                 ctx, norm_min, kill_mult, throttle_mult, dynamic_max,
-                hist_trend, pk_map, cfg,
+                effective_floor, hist_trend, pk_map, cfg,
             )
 
     # ── Final clamp ───────────────────────────────────────────────────────
@@ -813,11 +816,19 @@ def _normal_pacing_mp_ctv(
     kill_mult: float,
     throttle_mult: float,
     dynamic_max: float,
+    effective_floor: float,
     hist_trend: float,
     pk_map: Dict[Tuple[str, str], Dict],
     cfg: EngineConfig,
 ) -> Tuple[float, str, str]:
-    """Priority 5 — pacing-driven multiplier with continuous price-tier modifier."""
+    """Priority 5 — pacing-driven multiplier with continuous price-tier modifier.
+
+    2026-08-19: step size is floor_price × a % (cfg.pace_step_pct), not a flat
+    multiplier delta — see the comment in sbo/config/marketplace_ctv.yaml.
+    Uses effective_floor (the same estimated-floor fallback used for
+    norm_min/throttle_mult/kill_mult above) so a deal with no real floor still
+    gets a sensible step instead of $0.
+    """
     pacing = ctx.pacing or 0.0
     median_cpm = 0.0  # passed in context not available here; reason text will omit it
 
@@ -830,7 +841,9 @@ def _normal_pacing_mp_ctv(
 
     if pacing >= 1.05:
         # ── Overpacing ────────────────────────────────────────────────
-        base_down  = 0.10 if pacing < 1.15 else (0.15 if pacing < 1.25 else 0.20)
+        down_band  = "mod" if pacing < 1.15 else ("agg" if pacing < 1.25 else "critical")
+        down_pct   = getattr(cfg.pace_step_pct.down, down_band)
+        base_down  = (effective_floor * down_pct) / ctx.cpm_bid
         base_down *= hist_trend
         tier_down  = _price_tier_mod(ctx.rank_frac, "down", cfg)
         day_mod    = 0.5 if ctx.days_rem is not None and ctx.days_rem <= 7 else 1.0
@@ -862,8 +875,8 @@ def _normal_pacing_mp_ctv(
         code = "PACE_DOWN_MOD" if pacing < 1.15 else "PACE_DOWN_AGG"
         return new, code, (
             f"Pacing {round(pacing * 100)}% — drift down −{total_down:.3f} "
-            f"(base {base_down:.3f} × tier {tier_down:.3f}"
-            f"{' × 0.5 [≤7d]' if day_mod < 1 else ''}, "
+            f"(floor ${effective_floor:.2f} × {down_pct * 100:.1f}% × tier {tier_down:.3f}"
+            f"{' × 0.5 [≤7d]' if day_mod < 1 else ''} / cpm ${ctx.cpm_bid:.2f}, "
             f"cap {cfg.max_single_day_down}). "
             f"Rank {ctx.rank_frac:.2f}. Trend {hist_trend:.1f}× {ctx.history}. "
             f"{ctx.curr_mult:.3f} → {new:.3f}."
@@ -871,19 +884,26 @@ def _normal_pacing_mp_ctv(
 
     # ── Underpacing ───────────────────────────────────────────────────
     sev      = pacing < 0.75
+    band     = "critical" if sev else ("agg" if pacing >= 0.75 and pacing < 0.90 else "mod")
     time_tag = ""
+    # 2026-08-19: ≤7d reuses the 8-14d step % (only the EOC boost differs);
+    # ≤3d is handled entirely in the LAST_3_DAYS_UNDER branch above, so this
+    # ≤7d bucket only ever sees 4-7 days remaining.
     if ctx.days_rem is not None and ctx.days_rem <= 7:
-        base_up   = 0.10 if pacing >= 0.90 else (0.20 if pacing >= 0.75 else 0.30)
+        step_pct  = getattr(cfg.pace_step_pct.up_le7d, band)
         eoc_boost = 1.10 if pacing >= 0.90 else (1.20 if pacing >= 0.75 else 1.30)
+        base_up   = (effective_floor * step_pct) / ctx.cpm_bid
         base_up  *= eoc_boost
         time_tag  = "≤7d EOC"
     elif ctx.days_rem is not None and ctx.days_rem <= 14:
-        base_up   = 0.15 if pacing >= 0.90 else (0.25 if pacing >= 0.75 else 0.35)
+        step_pct  = getattr(cfg.pace_step_pct.up_8_14d, band)
         eoc_boost = 1.0
+        base_up   = (effective_floor * step_pct) / ctx.cpm_bid
         time_tag  = "≤14d"
     else:
-        base_up   = 0.10 if pacing >= 0.90 else (0.20 if pacing >= 0.75 else 0.30)
+        step_pct  = getattr(cfg.pace_step_pct.up_gt14d, band)
         eoc_boost = 1.0
+        base_up   = (effective_floor * step_pct) / ctx.cpm_bid
 
     base_up  *= hist_trend
     tier_up   = _price_tier_mod(ctx.rank_frac, "up_severe" if sev else "up_normal", cfg)
@@ -935,10 +955,10 @@ def _normal_pacing_mp_ctv(
         f"{' (' + time_tag + ')' if time_tag else ''}"
         f"{'[SEVERE]' if sev else ''}. "
         f"Raise +{total_up:.3f} "
-        f"(base {base_up:.3f}"
-        f"{' incl EOC ' + str(round(eoc_boost, 2)) + '×' if eoc_boost > 1 else ''}"
-        f" × tier {tier_up:.3f}). "
-        f"Rank {ctx.rank_frac:.2f}. Trend {hist_trend:.1f}× {ctx.history}. "
+        f"(floor ${effective_floor:.2f} × {step_pct * 100:.1f}%"
+        f"{' × EOC ' + str(round(eoc_boost, 2)) + '×' if eoc_boost > 1 else ''}"
+        f" × trend {hist_trend:.1f} × tier {tier_up:.3f} / cpm ${ctx.cpm_bid:.2f}). "
+        f"Rank {ctx.rank_frac:.2f}. {ctx.history}. "
         f"{ctx.curr_mult:.3f} → {new:.3f}."
     )
 
