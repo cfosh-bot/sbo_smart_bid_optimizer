@@ -358,6 +358,33 @@ def daily_aggregate_batch(id_col: str, where_sql: str, params: list, entity_ids:
     return df
 
 
+def li_true_cpm_batch(li_ids: list[str], date_only_where: str, date_only_params: list) -> dict[str, float]:
+    """BW_Line_Item_ID -> that line item's own overall Actual_Clearing_CPM,
+    across every publisher/deal/category -- ignoring whatever narrower
+    Publisher/Deal/Category/Targets/Reason/Floor filter is currently active.
+    Only the date range applies. Lets a line-item-level row show its true
+    total alongside a CPM that's already scoped to one publisher or deal."""
+    if not li_ids:
+        return {}
+    placeholders = ",".join(["?"] * len(li_ids))
+    sql = f"""
+        SELECT BW_Line_Item_ID,
+            CASE WHEN SUM(Deal_Impressions_1Day) > 0
+                 THEN SUM(Deal_Spend_1Day_USD) / SUM(Deal_Impressions_1Day) * 1000
+                 ELSE NULL END AS Actual_Clearing_CPM
+        FROM history
+        WHERE {date_only_where} AND BW_Line_Item_ID IN ({placeholders})
+        GROUP BY BW_Line_Item_ID
+    """
+    df = q(sql, date_only_params + li_ids)
+    if df.empty:
+        return {}
+    return {
+        str(r["BW_Line_Item_ID"]): r["Actual_Clearing_CPM"]
+        for _, r in df.iterrows() if pd.notna(r["Actual_Clearing_CPM"])
+    }
+
+
 def single_instance_batch(where_sql: str, params: list, li_deal_pairs: list[tuple]) -> pd.DataFrame:
     """ALL (line item, deal) pairs in one query. The dedupe key (Run_Date,
     BW_Line_Item_ID, Deal_ID) guarantees at most one row per pair per day, so
@@ -515,6 +542,16 @@ def _floor_text(ent) -> str:
     return f"Floor ${ent['Floor_Price']:.2f}" if pd.notna(ent.get("Floor_Price")) else ""
 
 
+def _li_total_cpm_text(ent) -> str:
+    """The line item's own overall actual clearing CPM (every publisher,
+    every deal) -- distinct from a CPM already scoped to one publisher or
+    one deal's slice of that same line item."""
+    return (
+        f"LI total actual CPM ${ent['LI_True_Actual_CPM']:.2f}"
+        if pd.notna(ent.get("LI_True_Actual_CPM")) else ""
+    )
+
+
 def render_load_more(total: int, key_prefix: str):
     page_key = f"{key_prefix}_n"
     n = st.session_state.get(page_key, PAGE_SIZE)
@@ -581,6 +618,9 @@ def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
                     else imps_text
                 )
                 st.caption(" · ".join(x for x in [f"SF {sf}" if pd.notna(sf) else "", vol_text, cpm_text] if x))
+                li_total = _li_total_cpm_text(ent)
+                if li_total:
+                    st.caption(li_total)
             elif id_col == "Publisher":
                 st.markdown(f"#### {eid}")
                 cat = ent.get("Category")
@@ -746,6 +786,13 @@ where_sql, params = build_filter_sql(
     floor_val=floor_val if floor_op != "No filter" else None,
 )
 
+# Date range only -- no Publisher/Category/Deal/Targets/Reason/Floor narrowing.
+# Used to show a line item's own true total clearing CPM (all publishers,
+# all deals) alongside a context that's already scoped narrower than the
+# whole line item, e.g. one publisher's or one deal's slice of it.
+date_only_where = "Run_Date BETWEEN ? AND ? AND Run_Date < ?"
+date_only_params = [str(date_range[0]), str(date_range[1]), today_str]
+
 view = st.radio("View", ["Line Item View", "Publisher View", "Deal View", "Total"], horizontal=True)
 
 for key in ("drill_li", "drill_pub", "drill_pub_li", "drill_deal"):
@@ -803,6 +850,13 @@ if view == "Line Item View":
             ["BW_Line_Item_ID"], where_sql, params, min_impressions, impressions_op=impressions_op,
             extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
                           "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
+        )
+        # True total is only worth showing separately when a Publisher/Category/
+        # Deal/etc filter up top has already narrowed this LI's own numbers --
+        # cheap to always merge in, entity_summary's own CPM already matches it
+        # when no such filter is active.
+        li_df["LI_True_Actual_CPM"] = li_df["BW_Line_Item_ID"].astype(str).map(
+            li_true_cpm_batch(li_df["BW_Line_Item_ID"].astype(str).tolist(), date_only_where, date_only_params)
         )
         clicked = render_aggregate_stack(li_df, "BW_Line_Item_ID", "li", where_sql, params, show_pacing_labels=True)
         if clicked:
@@ -883,6 +937,12 @@ elif view == "Publisher View":
             ["BW_Line_Item_ID"], pub_where, pub_params, min_impressions, impressions_op=impressions_op,
             extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
                           "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
+        )
+        # This CPM is scoped to just this publisher's slice of the line item --
+        # merge in the line item's own true total (every publisher, every deal)
+        # so it's visible right alongside it, not just the narrower number.
+        li_df["LI_True_Actual_CPM"] = li_df["BW_Line_Item_ID"].astype(str).map(
+            li_true_cpm_batch(li_df["BW_Line_Item_ID"].astype(str).tolist(), date_only_where, date_only_params)
         )
         clicked = render_aggregate_stack(li_df, "BW_Line_Item_ID", "pub_li", pub_where, pub_params,
                                           share_pct_label=True, show_pacing_labels=True)
@@ -971,6 +1031,9 @@ elif view == "Deal View":
                           "arg_max(Floor_Price, Run_Date) AS Floor_Price,",
         )
         li_df["Deal_ID"] = deal_id
+        li_df["LI_True_Actual_CPM"] = li_df["BW_Line_Item_ID"].astype(str).map(
+            li_true_cpm_batch(li_df["BW_Line_Item_ID"].astype(str).tolist(), date_only_where, date_only_params)
+        )
         render_single_instance_stack(
             li_df,
             lambda ent: (
@@ -979,6 +1042,7 @@ elif view == "Deal View":
                     str(ent["Line_Item_Name"]) if pd.notna(ent.get("Line_Item_Name")) else "",
                     _floor_text(ent),
                     _cpm_text(ent),
+                    _li_total_cpm_text(ent),
                     f"SF {ent['SF_Line_Item_ID']}",
                 ],
             ),
