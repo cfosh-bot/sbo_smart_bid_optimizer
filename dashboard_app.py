@@ -9,17 +9,24 @@ named view (never loaded fully into pandas -- this is what fixed the original
 dependency) draws the per-entity daily charts so kill days can be marked and
 hovered with the actual decision-reason text.
 
-Performance note: every stacked chart section fetches ALL of its entities'
-daily data in ONE batched query (grouped by entity + day), then splits it in
-pandas -- not one query per entity. The first version of this page fired a
-separate full-table query per row, which is what made clicking into a line
-item/publisher/deal painfully slow.
+Performance notes:
+  - Every stacked chart section fetches ALL of its *currently shown page's*
+    entities' daily data in ONE batched query (grouped by entity + day), not
+    one query per entity or per full entity set.
+  - Rendering is paginated at 100 entities per page ("Load N more" button).
+    An earlier version rendered every matching entity unconditionally --
+    fine for a few dozen rows, but a single line item can carry hundreds of
+    deals, and rendering hundreds of Altair charts in one page load is what
+    made "click into a line item" hang.
 
 Four views, chosen at the top:
   - Line Item View : one daily chart per line item (with that day's pacing %
                       labeled above the plotted points), click -> its deals
                       broken out by day (same pacing labels)
-  - Publisher View : one daily chart per publisher, click -> its deals
+  - Publisher View : one daily chart per publisher, click -> the line items
+                      delivering through it (still aggregate, not deal-level
+                      -- too granular one level too soon), click one of those
+                      -> deals for that (publisher, line item) pair
   - Deal View      : one daily chart per deal (aggregated across whatever line
                       items carry it), click -> that deal broken out by line item
   - Total          : whole-filtered-set daily trend + by-deal/by-line/
@@ -30,14 +37,12 @@ Two chart styles:
     all of which can span more than one (line item, deal) pair) hover-show
     that day's % of deals killed instead of a single reason.
   - "single-instance" rows (one specific (line item, deal) pair -- reached by
-    drilling into one line item or one publisher, or isolating one deal) mark
-    killed days with a red X and hover-show the actual Decision_Reason text.
-    The bid line is never hidden on a killed day -- killed just means the bid
-    was suppressed toward floor, not that there's no bid to show.
-
-No cap on how many entities render -- every matching entity's chart is drawn
-(use the min-impressions filter to narrow the set if the browser struggles at
-very large volumes).
+    drilling into one line item, one publisher's line item, or isolating one
+    deal) mark killed days with a red X and hover-show the actual
+    Decision_Reason text. The bid line is never hidden on a killed day --
+    killed just means the bid was suppressed toward floor, not that there's
+    no bid to show. Floor price is always shown (small grey text) wherever a
+    deal is represented -- deal-level rows should never hide it.
 
 Every view ends with a decision-reason-by-day stacked bar and a reason-code
 glossary (definitions sourced from sbo/multiplier_engine_mp_ctv.py's own
@@ -484,7 +489,47 @@ def chart_single_instance(daily_df: pd.DataFrame, show_pacing_labels: bool = Fal
     return chart
 
 
-# ── row renderers (no pagination -- every matching entity renders) ──────
+# ── row renderers (paginated: 100 charts at a time, not all at once) ────
+#
+# An earlier version rendered every matching entity unconditionally. That
+# works fine for a few dozen rows, but a single line item can carry hundreds
+# of deals, and rendering hundreds of Altair charts in one page load is what
+# made "click into a line item" hang. Capped back to a page size with a
+# "Load more" button -- the batched SQL query (already fast) is now also
+# scoped to just the page being shown, not the full entity set.
+
+PAGE_SIZE = 100
+
+
+def _cpm_text(ent) -> str:
+    return f"Actual CPM ${ent['Actual_Clearing_CPM']:.2f}" if pd.notna(ent.get("Actual_Clearing_CPM")) else "Actual CPM N/A"
+
+
+def _floor_text(ent) -> str:
+    return f"Floor ${ent['Floor_Price']:.2f}" if pd.notna(ent.get("Floor_Price")) else ""
+
+
+def render_load_more(total: int, key_prefix: str):
+    page_key = f"{key_prefix}_n"
+    n = st.session_state.get(page_key, PAGE_SIZE)
+    if n < total:
+        st.caption(f"Showing {min(n, total)} of {total}")
+        if st.button(f"Load {min(PAGE_SIZE, total - n)} more", key=f"{key_prefix}_more"):
+            st.session_state[page_key] = n + PAGE_SIZE
+            st.rerun()
+    else:
+        st.caption(f"All {total} loaded.")
+
+
+def reset_pagination_if_changed(signature: str):
+    """Clears every page-position counter when the filters/view/drill state
+    changes, so a stale 'loaded 300 of 40' from a previous, broader view
+    never lingers into a new, narrower one."""
+    if st.session_state.get("_pg_sig") != signature:
+        for k in [k for k in st.session_state if k.endswith("_n")]:
+            del st.session_state[k]
+        st.session_state["_pg_sig"] = signature
+
 
 def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
                             where_sql: str, params: list, show_pacing_labels: bool = False):
@@ -497,26 +542,43 @@ def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
     # per id_col, but a duplicate here would crash st.button on a repeated
     # key, so belt-and-suspenders it.
     entities = entities.drop_duplicates(subset=[id_col])
-    all_ids = entities[id_col].dropna().astype(str).tolist()
-    batch = daily_aggregate_batch(id_col, where_sql, params, all_ids)
+    page_key = f"{key_prefix}_n"
+    n = st.session_state.get(page_key, PAGE_SIZE)
+    shown = entities.head(n)
+    shown_ids = shown[id_col].dropna().astype(str).tolist()
+    batch = daily_aggregate_batch(id_col, where_sql, params, shown_ids)
 
     clicked = None
-    for _, ent in entities.iterrows():
+    for _, ent in shown.iterrows():
         eid = str(ent[id_col])
         left, right = st.columns([1, 4])
         with left:
-            label = safe_label(
-                [ent.get("Line_Item_Name")] if "Line_Item_Name" in ent else [ent.get(id_col)], eid
-            ) if id_col == "BW_Line_Item_ID" else safe_label([ent.get(id_col)], eid)
-            st.markdown(f"#### {label}")
-            extra = f"BW {ent['BW_Line_Item_ID']}" if id_col == "BW_Line_Item_ID" and "SF_Line_Item_ID" in ent else ""
-            if extra and "SF_Line_Item_ID" in ent:
-                extra += f" · SF {ent['SF_Line_Item_ID']}"
-            if ent.get("Category") and id_col == "Publisher":
-                extra = str(ent["Category"])
-            if ent.get("Publisher") and id_col == "Deal_ID":
-                extra = str(ent["Publisher"])
-            st.caption(" · ".join(x for x in [extra, f"{safe_int(ent['Impressions']):,} imps"] if x))
+            imps_text = f"{safe_int(ent['Impressions']):,} imps"
+            cpm_text = _cpm_text(ent)
+            if id_col == "BW_Line_Item_ID":
+                # The line item name can be very long (real examples run past
+                # 100 characters) -- it's small grey text below the short ID,
+                # not the heading, so it doesn't dominate the row.
+                st.markdown(f"#### {eid}")
+                name = ent.get("Line_Item_Name")
+                if pd.notna(name):
+                    st.caption(str(name))
+                sf = ent.get("SF_Line_Item_ID")
+                st.caption(" · ".join(x for x in [f"SF {sf}" if pd.notna(sf) else "", imps_text, cpm_text] if x))
+            elif id_col == "Publisher":
+                st.markdown(f"#### {eid}")
+                cat = ent.get("Category")
+                st.caption(" · ".join(x for x in [str(cat) if pd.notna(cat) else "", imps_text, cpm_text] if x))
+            elif id_col == "Deal_ID":
+                st.markdown(f"#### {eid}")
+                floor = _floor_text(ent)
+                if floor:
+                    st.caption(floor)
+                pub = ent.get("Publisher")
+                st.caption(" · ".join(x for x in [str(pub) if pd.notna(pub) else "", imps_text, cpm_text] if x))
+            else:
+                st.markdown(f"#### {eid}")
+                st.caption(imps_text)
             if st.button("View →", key=f"{key_prefix}_{eid}"):
                 clicked = eid
         with right:
@@ -526,25 +588,37 @@ def render_aggregate_stack(entities: pd.DataFrame, id_col: str, key_prefix: str,
                 st.altair_chart(chart, width='stretch', theme=None)
             else:
                 st.caption("No daily delivery data for this entity in range.")
+    render_load_more(len(entities), key_prefix)
     return clicked
 
 
 def render_single_instance_stack(entities: pd.DataFrame, label_fn, where_sql: str, params: list,
                                   key_prefix: str, show_pacing_labels: bool = False):
     """Stacked list of single-(line item, deal)-instance charts, e.g. the deals
-    under one line item/publisher, or the line items carrying one isolated deal."""
+    under one line item/publisher, or the line items carrying one isolated deal.
+
+    label_fn(ent) -> (big_text, [grey_caption_lines]). Every deal-representing
+    context always includes a "Floor $X" line -- floor price should be visible
+    wherever a deal shows up, not just in the breakout table below."""
     if entities.empty:
         st.info("No rows match the current filters.")
         return
     entities = entities.drop_duplicates(subset=["BW_Line_Item_ID", "Deal_ID"])
-    pairs = list(zip(entities["BW_Line_Item_ID"].astype(str), entities["Deal_ID"].astype(str)))
+    page_key = f"{key_prefix}_n"
+    n = st.session_state.get(page_key, PAGE_SIZE)
+    shown = entities.head(n)
+    pairs = list(zip(shown["BW_Line_Item_ID"].astype(str), shown["Deal_ID"].astype(str)))
     batch = single_instance_batch(where_sql, params, pairs)
 
-    for _, ent in entities.iterrows():
+    for _, ent in shown.iterrows():
         li_id, deal_id = str(ent["BW_Line_Item_ID"]), str(ent["Deal_ID"])
         left, right = st.columns([1, 4])
         with left:
-            st.markdown(label_fn(ent))
+            big, greys = label_fn(ent)
+            st.markdown(f"#### {big}")
+            for g in greys:
+                if g:
+                    st.caption(g)
             st.caption(f"{safe_int(ent['Impressions']):,} imps")
         with right:
             daily = batch[(batch["BW_Line_Item_ID"] == li_id) & (batch["Deal_ID"] == deal_id)] if not batch.empty else pd.DataFrame()
@@ -553,6 +627,7 @@ def render_single_instance_stack(entities: pd.DataFrame, label_fn, where_sql: st
                 st.altair_chart(chart, width='stretch', theme=None)
             else:
                 st.caption("No daily delivery data for this pair in range.")
+    render_load_more(len(entities), key_prefix)
 
 
 def render_reason_footer(where_sql: str, params: list):
@@ -653,9 +728,16 @@ where_sql, params = build_filter_sql(
 
 view = st.radio("View", ["Line Item View", "Publisher View", "Deal View", "Total"], horizontal=True)
 
-for key in ("drill_li", "drill_pub", "drill_deal"):
+for key in ("drill_li", "drill_pub", "drill_pub_li", "drill_deal"):
     if key not in st.session_state:
         st.session_state[key] = None
+
+reset_pagination_if_changed(
+    where_sql + str(params) + view + str((
+        st.session_state.drill_li, st.session_state.drill_pub,
+        st.session_state.drill_pub_li, st.session_state.drill_deal,
+    ))
+)
 
 # ── header stats ─────────────────────────────────────────────────────────
 
@@ -705,8 +787,7 @@ if view == "Line Item View":
         )
         render_single_instance_stack(
             deal_df,
-            lambda ent: f"**{ent['Deal_ID']}**\n\n{ent['Publisher']} · {ent['Category']} · Floor ${ent['Floor_Price']:.2f}"
-            if pd.notna(ent.get("Floor_Price")) else f"**{ent['Deal_ID']}**\n\n{ent['Publisher']} · {ent['Category']}",
+            lambda ent: (ent["Deal_ID"], [_floor_text(ent), f"{ent['Publisher']} · {ent['Category']}"]),
             where_sql, params, "li_deal", show_pacing_labels=True,
         )
 
@@ -723,6 +804,7 @@ if view == "Line Item View":
 
 elif view == "Publisher View":
     if not st.session_state.drill_pub:
+        # Level 1: publishers.
         st.subheader("Publishers")
         pub_df = entity_summary(
             ["Publisher"], where_sql, params, min_impressions, impressions_op=impressions_op,
@@ -739,31 +821,57 @@ elif view == "Publisher View":
                     "Actual_Clearing_CPM", "Avg_Bid", "Pct_Killed"]],
             width='stretch', hide_index=True,
         )
-    else:
+    elif not st.session_state.drill_pub_li:
+        # Level 2: line items delivering through this publisher -- NOT deals.
+        # Breaking straight into every (line item, deal) pair here was too
+        # granular to load; that detail is one more click away, scoped to a
+        # specific line item, same as Line Item View's own drill-down.
         pub = st.session_state.drill_pub
         if st.button("⬅ Back to publishers"):
             st.session_state.drill_pub = None
             st.rerun()
-        st.subheader(f"Deals for publisher {pub}")
+        st.subheader(f"Line items delivering through {pub}")
         pub_where = where_sql + " AND Publisher = ?"
         pub_params = params + [pub]
 
-        deal_df = entity_summary(
-            ["Deal_ID", "Publisher", "Category", "BW_Line_Item_ID"], pub_where, pub_params, min_impressions, impressions_op=impressions_op,
-            extra_select="arg_max(Floor_Price, Run_Date) AS Floor_Price, "
+        li_df = entity_summary(
+            ["BW_Line_Item_ID"], pub_where, pub_params, min_impressions, impressions_op=impressions_op,
+            extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
                           "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
         )
+        clicked = render_aggregate_stack(li_df, "BW_Line_Item_ID", "pub_li", pub_where, pub_params)
+        if clicked:
+            st.session_state.drill_pub_li = clicked
+            st.rerun()
 
-        def _pub_deal_label(ent):
-            # A Deal_ID can be shared across more than one line item under the
-            # same publisher (confirmed with real data) -- without the line
-            # item name/id here, repeated Deal_IDs would render as identical,
-            # undistinguishable rows.
-            li = safe_label([ent.get("Line_Item_Name")], ent["BW_Line_Item_ID"])
-            floor = f" · Floor ${ent['Floor_Price']:.2f}" if pd.notna(ent.get("Floor_Price")) else ""
-            return f"**{ent['Deal_ID']}**\n\n{ent['Category']}{floor}\n\nLine item: {li} (BW {ent['BW_Line_Item_ID']})"
+        st.subheader(f"Line items delivering through {pub} -- summary")
+        st.dataframe(
+            li_df[["Line_Item_Name", "BW_Line_Item_ID", "SF_Line_Item_ID", "Impressions",
+                   "Impression_Share_Pct", "Avg_Bid", "Actual_Clearing_CPM", "Pct_Killed"]],
+            width='stretch', hide_index=True,
+        )
+    else:
+        # Level 3: deals for this (publisher, line item) pair.
+        pub = st.session_state.drill_pub
+        li_id = st.session_state.drill_pub_li
+        if st.button("⬅ Back to line items"):
+            st.session_state.drill_pub_li = None
+            st.rerun()
+        pub_li_where = where_sql + " AND Publisher = ? AND BW_Line_Item_ID = ?"
+        pub_li_params = params + [pub, li_id]
+        name_row = q("SELECT DISTINCT Line_Item_Name FROM history WHERE BW_Line_Item_ID = ? LIMIT 1", [li_id])
+        li_name = safe_label([name_row.iloc[0]["Line_Item_Name"]] if not name_row.empty else [], li_id)
+        st.subheader(f"Deals for {li_name} ({li_id}) via {pub}")
 
-        render_single_instance_stack(deal_df, _pub_deal_label, where_sql, params, "pub_deal")
+        deal_df = entity_summary(
+            ["Deal_ID", "Category", "BW_Line_Item_ID"], pub_li_where, pub_li_params, min_impressions, impressions_op=impressions_op,
+            extra_select="arg_max(Floor_Price, Run_Date) AS Floor_Price,",
+        )
+        render_single_instance_stack(
+            deal_df,
+            lambda ent: (ent["Deal_ID"], [_floor_text(ent), str(ent.get("Category") or "")]),
+            where_sql, params, "pub_li_deal",
+        )
 
         st.subheader("Breakout: impression share, avg bid, kill %, floor price by deal")
         st.dataframe(
@@ -806,12 +914,16 @@ elif view == "Deal View":
         li_df = entity_summary(
             ["BW_Line_Item_ID"], deal_where, deal_params, min_impressions, impressions_op=impressions_op,
             extra_select="arg_max(SF_Line_Item_ID, Run_Date) AS SF_Line_Item_ID, "
-                          "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
+                          "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name, "
+                          "arg_max(Floor_Price, Run_Date) AS Floor_Price,",
         )
         li_df["Deal_ID"] = deal_id
         render_single_instance_stack(
             li_df,
-            lambda ent: f"**{safe_label([ent['Line_Item_Name']], ent['BW_Line_Item_ID'])}**\n\nBW {ent['BW_Line_Item_ID']} · SF {ent['SF_Line_Item_ID']}",
+            lambda ent: (
+                safe_label([ent["Line_Item_Name"]], ent["BW_Line_Item_ID"]),
+                [_floor_text(ent), f"BW {ent['BW_Line_Item_ID']} · SF {ent['SF_Line_Item_ID']}"],
+            ),
             where_sql, params, "deal_li",
         )
 
