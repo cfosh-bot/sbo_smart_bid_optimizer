@@ -702,10 +702,10 @@ with f2:
         impressions_op = st.selectbox("Impressions", IMPRESSIONS_OPERATORS, index=0, label_visibility="visible")
     with i2:
         min_impressions = st.number_input(
-            "Total impressions in range (per entity)", min_value=0, value=250_000, step=10_000,
-            help="Defaults to 250,000, not 0 -- the droplet has 961MB RAM, and rendering all "
-                 "~860 line items at once (the count at 0) is what made the first deploy hang. "
-                 "Set to 0 deliberately if you want everything, but expect it to be slow there.",
+            "Total impressions in range (per entity)", min_value=0, value=0, step=10_000,
+            help="Defaults to 0 -- pagination (100 entities at a time) and query caching keep "
+                 "broad views from overloading the droplet's 961MB RAM, so this is now just a "
+                 "convenience filter, not a safety limit. Raise it to cut noise from tiny entities.",
         )
 
 f3, f4 = st.columns(2)
@@ -825,7 +825,14 @@ if view == "Line Item View":
         )
         render_single_instance_stack(
             deal_df,
-            lambda ent: (ent["Deal_ID"], [_floor_text(ent), f"{ent['Publisher']} · {ent['Category']}"]),
+            lambda ent: (
+                ent["Deal_ID"],
+                [
+                    _floor_text(ent),
+                    _cpm_text(ent),
+                    f"{ent['Publisher']} · {ent['Category']}",
+                ],
+            ),
             where_sql, params, "li_deal", show_pacing_labels=True,
         )
 
@@ -878,7 +885,7 @@ elif view == "Publisher View":
                           "arg_max(Line_Item_Name, Run_Date) AS Line_Item_Name,",
         )
         clicked = render_aggregate_stack(li_df, "BW_Line_Item_ID", "pub_li", pub_where, pub_params,
-                                          share_pct_label=True)
+                                          share_pct_label=True, show_pacing_labels=True)
         if clicked:
             st.session_state.drill_pub_li = clicked
             st.rerun()
@@ -908,8 +915,15 @@ elif view == "Publisher View":
         )
         render_single_instance_stack(
             deal_df,
-            lambda ent: (ent["Deal_ID"], [_floor_text(ent), str(ent.get("Category") or "")]),
-            where_sql, params, "pub_li_deal",
+            lambda ent: (
+                ent["Deal_ID"],
+                [
+                    _floor_text(ent),
+                    _cpm_text(ent),
+                    str(ent.get("Category") or ""),
+                ],
+            ),
+            where_sql, params, "pub_li_deal", show_pacing_labels=True,
         )
 
         st.subheader("Breakout: impression share, avg bid, kill %, floor price by deal")
@@ -964,11 +978,12 @@ elif view == "Deal View":
                 [
                     str(ent["Line_Item_Name"]) if pd.notna(ent.get("Line_Item_Name")) else "",
                     _floor_text(ent),
+                    _cpm_text(ent),
                     f"SF {ent['SF_Line_Item_ID']}",
                 ],
             ),
             where_sql, params, "deal_li",
-            share_pct=True,
+            share_pct=True, show_pacing_labels=True,
         )
 
         st.subheader("Breakout: impression share by line item")
