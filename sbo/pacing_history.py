@@ -26,6 +26,7 @@ from datetime import date, datetime, timedelta
 from pathlib import Path
 from typing import Optional
 
+import duckdb
 import pandas as pd
 
 RUNS_DIR = Path("/root/sbo/runs")
@@ -62,6 +63,21 @@ DASHBOARD_COLUMN_RENAMES = {"_Included_Deal_Lists": "Included_Deal_Lists"}
 # Columns sourced from the paired `_full` run's 03b_deal_performance_1day.parquet
 # (see _load_deal_performance_1day) rather than 04_bid_optimizer.parquet.
 DEAL_PERF_COLUMNS = ["Deal_Impressions_1Day", "Deal_Spend_1Day_USD"]
+
+# Full live-file column order -- the single source of truth for both the
+# pandas empty-frame fallback and the DuckDB merge path below.
+# NOT derived by concatenating DASHBOARD_COLUMNS + DEAL_PERF_COLUMNS --
+# dashboard_app.py's DuckDB read_csv(..., columns={...}) matches columns by
+# POSITION, not name (confirmed directly: a reordered-but-same-named CSV
+# raises "Header mismatch at position", it doesn't just remap). This order
+# must stay in lockstep with the `columns` dict in dashboard_app.py's
+# get_connection() -- if that dict's order ever changes, this must too.
+LIVE_FILE_COLUMNS = [
+    "Run_Date", "SF_Line_Item_ID", "BW_Line_Item_ID", "Line_Item_Name", "Publisher",
+    "Deal_ID", "CPM_Bid", "Floor_Price", "Category", "Pacing_Pct",
+    "Effective_Bid_Current", "Effective_Bid_New", "Decision_Reason",
+    "Deal_Impressions_1Day", "Deal_Spend_1Day_USD", "Targets_537", "Included_Deal_Lists",
+]
 
 DEDUPE_KEYS = ["Run_Date", "BW_Line_Item_ID", "Deal_ID"]
 
@@ -249,13 +265,6 @@ def load_run_slice(run_dir: Path) -> pd.DataFrame:
 # ######################################################################
 
 
-def _read_live_file() -> pd.DataFrame:
-    if not LIVE_FILE.exists():
-        renamed_cols = [DASHBOARD_COLUMN_RENAMES.get(c, c) for c in DASHBOARD_COLUMNS]
-        return pd.DataFrame(columns=["Run_Date"] + renamed_cols + DEAL_PERF_COLUMNS)
-    return pd.read_csv(LIVE_FILE, compression="gzip", dtype=str)
-
-
 def _write_live_file(df: pd.DataFrame) -> None:
     HISTORY_DIR.mkdir(parents=True, exist_ok=True)
     df = df.sort_values("Run_Date")
@@ -302,6 +311,139 @@ def _roll_off_old_rows(df: pd.DataFrame) -> pd.DataFrame:
 
 
 # ######################################################################
+# DuckDB-backed merge (the daily hot path -- append_run, cleanup_old_runs)
+# ######################################################################
+#
+# The daily cron's `append` step used to load the WHOLE live file into a
+# pandas DataFrame with dtype=str before touching a single new row. That was
+# fine when the file was small, but at 2.5M+ rows it materializes ~776MB of
+# Python string objects -- confirmed via journalctl as exactly what got that
+# step OOM-killed on the droplet (961MB RAM total). The functions below
+# replace that path for the two things that run every single day: appending
+# the new slice, and looking up which dates are already captured for
+# cleanup. Both stream the live file through DuckDB instead of materializing
+# it in Python -- the same fix already applied to the dashboard itself for
+# the same reason. build_history() (a bounded, manually-triggered backfill,
+# not part of the daily cron) still uses the plain pandas path above; it
+# never reads the accumulated live file, so it isn't the OOM risk.
+
+
+# DuckDB auto-tunes its own buffer/memory budget from the *detected* system
+# RAM, which is exactly the wrong thing to rely on here -- tested locally on
+# a dev machine, an unbounded connection still peaked over 2GB processing
+# this file, because DuckDB happily used what a full-size machine offered.
+# The droplet has 961MB total, so the limit is pinned explicitly rather than
+# trusted to auto-detection: DuckDB spills to temp disk instead of growing
+# past this, which is exactly the tradeoff wanted (slower, not OOM-killed).
+DUCKDB_MEMORY_LIMIT = "400MB"
+DUCKDB_THREADS = 2
+
+
+def _bounded_duckdb_connection() -> duckdb.DuckDBPyConnection:
+    con = duckdb.connect()
+    con.execute(f"PRAGMA memory_limit='{DUCKDB_MEMORY_LIMIT}'")
+    con.execute(f"PRAGMA threads={DUCKDB_THREADS}")
+    # The explicit ORDER BY Run_Date in the COPY query below is what actually
+    # keeps the output file sorted -- this setting is a separate, internal
+    # DuckDB execution-order guarantee for streaming results that isn't needed
+    # here, and disabling it is what DuckDB's own OOM error suggested: without
+    # it, a 2.5M-row ORDER BY needed more than the 400MB budget to buffer.
+    con.execute("PRAGMA preserve_insertion_order=false")
+    return con
+
+
+def _select_cast_varchar(cols: list[str]) -> str:
+    return ", ".join(f"CAST({c} AS VARCHAR) AS {c}" for c in cols)
+
+
+def _combined_relation_sql(drop_run_date: Optional[str]) -> str:
+    """SQL for 'new_df UNION ALL the existing live file (minus drop_run_date)'.
+    Assumes a `new_df` relation is already registered on the connection."""
+    cols_sql = _select_cast_varchar(LIVE_FILE_COLUMNS)
+    new_sql = f"SELECT {cols_sql} FROM new_df"
+    if not LIVE_FILE.exists():
+        return new_sql
+    where = f"WHERE Run_Date != '{drop_run_date}'" if drop_run_date else ""
+    existing_sql = f"""
+        SELECT {cols_sql} FROM read_csv('{LIVE_FILE}', compression='gzip', header=true, all_varchar=true)
+        {where}
+    """
+    return f"{new_sql} UNION ALL BY NAME {existing_sql}"
+
+
+def _merge_into_live_file(new_df: pd.DataFrame, drop_run_date: Optional[str]) -> int:
+    """Combine new_df into the live file, roll old rows off into monthly
+    archives, and write the result -- all via DuckDB streaming. Returns the
+    resulting live-file row count. The only pandas DataFrame ever fully
+    materialized here is `old_rows`, which is small by construction (just
+    the tail crossing the 90-day boundary on any given day, not the whole
+    history) -- safe for the existing pandas archival logic to handle as-is.
+    """
+    con = _bounded_duckdb_connection()
+    con.register("new_df", new_df)
+    combined_sql = _combined_relation_sql(drop_run_date)
+    cutoff = (date.today() - timedelta(days=LIVE_RETENTION_DAYS)).isoformat()
+
+    old_rows = con.sql(f"SELECT * FROM ({combined_sql}) WHERE Run_Date < '{cutoff}'").fetchdf()
+    if not old_rows.empty:
+        _archive_old_rows(old_rows)
+
+    HISTORY_DIR.mkdir(parents=True, exist_ok=True)
+    tmp_path = LIVE_FILE.with_suffix(".tmp.gz")
+    # No ORDER BY: sorting 2.5M+ rows needed more than the 400MB budget to
+    # buffer (confirmed -- it OOM'd even with preserve_insertion_order off).
+    # Nothing downstream depends on physical row order -- the dashboard
+    # always queries with an explicit Run_Date predicate, never relies on
+    # file order -- so it's dropped rather than raising the memory ceiling.
+    con.sql(f"""
+        COPY (
+            SELECT * FROM ({combined_sql}) WHERE Run_Date >= '{cutoff}'
+        ) TO '{tmp_path}' (HEADER, COMPRESSION gzip)
+    """)
+    tmp_path.replace(LIVE_FILE)
+
+    total = con.sql(f"""
+        SELECT COUNT(*) FROM ({combined_sql}) WHERE Run_Date >= '{cutoff}'
+    """).fetchone()[0]
+    return total
+
+
+def _archive_old_rows(old_rows: pd.DataFrame) -> None:
+    """Archive rows older than the retention window into monthly files.
+    old_rows is always small (the tail crossing the 90-day boundary on any
+    given day), so pandas here is fine -- this is not the OOM path. Same
+    dedup semantics (keep last) as the original _roll_off_old_rows."""
+    old_rows = old_rows.copy()
+    old_rows["_year_month"] = old_rows["Run_Date"].str.slice(0, 7)
+    for year_month, group in old_rows.groupby("_year_month"):
+        group = group.drop(columns=["_year_month"])
+        archive_path = _archive_path_for_month(year_month)
+        if archive_path.exists():
+            existing = pd.read_csv(archive_path, compression="gzip", dtype=str)
+            combined = pd.concat([existing, group], ignore_index=True)
+            combined = combined.drop_duplicates(subset=DEDUPE_KEYS, keep="last")
+        else:
+            combined = group
+        tmp_path = archive_path.with_suffix(".tmp.gz")
+        combined.to_csv(tmp_path, compression="gzip", index=False)
+        tmp_path.replace(archive_path)
+        print(f"  Archived {len(group):,} rows -> {archive_path.name}")
+
+
+def _live_file_distinct_dates() -> set[str]:
+    """Just the distinct Run_Date values from the live file -- used by
+    cleanup_old_runs, which only ever needed this one column. Streamed via
+    DuckDB instead of pandas-loading all 17 columns of the whole file."""
+    if not LIVE_FILE.exists():
+        return set()
+    con = _bounded_duckdb_connection()
+    rows = con.sql(f"""
+        SELECT DISTINCT Run_Date FROM read_csv('{LIVE_FILE}', compression='gzip', header=true, all_varchar=true)
+    """).fetchall()
+    return {r[0] for r in rows}
+
+
+# ######################################################################
 # Public entry points
 # ######################################################################
 
@@ -336,13 +478,9 @@ def append_run(run_dir: Path) -> None:
     new_slice = load_run_slice(run_dir)
     run_date = new_slice["Run_Date"].iloc[0]
 
-    live = _read_live_file()
-    live = live[live["Run_Date"] != run_date]  # drop same-day rows in case of rerun
-    combined = pd.concat([live, new_slice], ignore_index=True)
-    combined = _roll_off_old_rows(combined)
-    _write_live_file(combined)
+    total = _merge_into_live_file(new_slice, drop_run_date=run_date)
     print(f"Appended {len(new_slice):,} rows for {run_date} -> {LIVE_FILE} "
-          f"({len(combined):,} total rows in live file)")
+          f"({total:,} total rows in live file)")
 
 
 def cleanup_old_runs(keep_days: int = DEFAULT_RAW_KEEP_DAYS, dry_run: bool = False) -> None:
@@ -355,8 +493,7 @@ def cleanup_old_runs(keep_days: int = DEFAULT_RAW_KEEP_DAYS, dry_run: bool = Fal
         print(f"No marketplace_ctv run folders older than {cutoff_date}.")
         return
 
-    live = _read_live_file()
-    captured_dates = set(live["Run_Date"].unique()) if not live.empty else set()
+    captured_dates = _live_file_distinct_dates()
 
     # Also check archives for dates that may have already rolled off the live file
     if ARCHIVE_DIR.exists():
