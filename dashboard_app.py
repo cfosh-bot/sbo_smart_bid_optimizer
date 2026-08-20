@@ -71,6 +71,7 @@ KILL_REASON_CODES = [
     "PRICE_KILL_HOLD_FALLBACK",
     "CAP_KILL",
     "CAT_CAP_KILL",
+    "BACKFILL_ESTIMATED_KILL",
 ]
 REASON_CODE_EXPR = "regexp_extract(Decision_Reason, '^([A-Z_]+)', 1)"
 # Inlined as SQL literals, not bound `?` params -- KILL_REASON_CODES is a fixed,
@@ -84,6 +85,8 @@ IS_KILLED_EXPR = f"({REASON_CODE_EXPR} IN ({_KILL_LIST_SQL}))"
 # actual Decision_Reason text seen in the data -- not guessed. Worth a sanity
 # check against the pipeline if any of these look off.
 REASON_CODE_GLOSSARY = {
+    "BACKFILL_ESTIMATED_HOLD": "Not a real engine decision -- reconstructed after a day the pipeline never ran. Bid held at whatever was in effect that day.",
+    "BACKFILL_ESTIMATED_KILL": "Not a real engine decision -- reconstructed after a day the pipeline never ran. Estimated killed because bid < floor x 0.95.",
     "PACE_HOLD_ONTARGET": "Pacing on target (95-105%) -- no bid adjustment",
     "PACE_UP_AGG": "Behind pace -- aggressive bid increase",
     "PACE_UP_MOD": "Behind pace -- moderate bid increase",
