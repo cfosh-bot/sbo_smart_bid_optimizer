@@ -6,6 +6,24 @@
 set -e  # exit immediately if any command fails
 
 cd /root/sbo
+set -a
+source .env
+set +a
+
+# Slack alert on any failure below (git_guard block, or a failing pipeline
+# stage) -- a blocked/failed run used to just sit silently in this log file
+# until someone happened to check it (see 2026-08-19). $LAST_STAGE lets the
+# message say roughly where it broke instead of just "something failed."
+LAST_STAGE="startup"
+notify_failure() {
+    local exit_code=$?
+    if [ -n "$SLACK_WEBHOOK_URL" ]; then
+        curl -s -X POST -H 'Content-Type: application/json' \
+            --data "{\"text\": \":rotating_light: MP CTV daily run FAILED during '${LAST_STAGE}' (exit ${exit_code}) on $(date -u '+%Y-%m-%d %H:%M UTC'). Check /root/sbo/logs/sbo_mp_ctv.log on the droplet.\"}" \
+            "$SLACK_WEBHOOK_URL" >/dev/null 2>&1 || true
+    fi
+}
+trap notify_failure ERR
 
 # Auto-sync with GitHub before running -- avoids a full day's run getting
 # BLOCKED by git_guard.py just because a `git pull` hadn't happened yet
@@ -15,6 +33,7 @@ cd /root/sbo
 # the case actually worth stopping for (someone editing the droplet
 # directly), so it's left for manual reconciliation rather than silently
 # pulled over.
+LAST_STAGE="git sync"
 git fetch origin main
 LOCAL_SHA=$(git rev-parse HEAD)
 REMOTE_SHA=$(git rev-parse origin/main)
@@ -27,18 +46,17 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
     git pull origin main
 fi
 
-set -a
-source .env
-set +a
-
 PYTHON=/root/sbo/.venv/bin/python
 CONFIG=sbo/config/marketplace_ctv.yaml
 SID="$SHEET_ID_MARKETPLACE_CTV"
 
 echo "=== MP CTV daily run start: $(date) ==="
 
+LAST_STAGE="phase3"
 $PYTHON -m sbo.pipeline phase3 --config "$CONFIG" --sheet-id "$SID"
+LAST_STAGE="full"
 $PYTHON -m sbo.pipeline full --config "$CONFIG" --sheet-id "$SID"
+LAST_STAGE="pushonly"
 $PYTHON -m sbo.pipeline pushonly --config "$CONFIG" --sheet-id "$SID"
 
 # --- Dashboard history (non-critical: log failure but don't fail the run) ---
