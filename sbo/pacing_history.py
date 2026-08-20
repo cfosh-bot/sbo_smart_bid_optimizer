@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import re
 import shutil
 from datetime import date, datetime, timedelta
@@ -481,6 +482,24 @@ def append_run(run_dir: Path) -> None:
     total = _merge_into_live_file(new_slice, drop_run_date=run_date)
     print(f"Appended {len(new_slice):,} rows for {run_date} -> {LIVE_FILE} "
           f"({total:,} total rows in live file)")
+
+    # Push the updated live file to the private HF Dataset repo the public
+    # Streamlit Cloud dashboard reads from. Non-critical -- the real pipeline
+    # run (Beeswax push) already succeeded above this point, and a failed
+    # upload here just means the public dashboard is a day stale, not a
+    # pipeline failure.
+    try:
+        from huggingface_hub import upload_file
+        upload_file(
+            path_or_fileobj=str(LIVE_FILE),
+            path_in_repo="mp_ctv_pacing_history.csv.gz",
+            repo_id="Cfosh/mp-ctv-dashboard",
+            repo_type="dataset",
+            token=os.environ["SBO_DASHBOARD_WRITE_TOKEN"],
+        )
+        print("Uploaded live file to HF Dataset repo for public dashboard.")
+    except Exception as e:
+        print(f"WARNING: dashboard history upload to HF failed (non-critical): {e}")
 
 
 def cleanup_old_runs(keep_days: int = DEFAULT_RAW_KEEP_DAYS, dry_run: bool = False) -> None:

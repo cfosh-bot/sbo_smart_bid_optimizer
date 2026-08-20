@@ -20,6 +20,9 @@ python-dotenv>=1.0.0
 # UI
 streamlit>=1.36.0
 
+# Public dashboard data bridge (droplet -> private HF Dataset repo)
+huggingface_hub>=0.24.0
+
 # Dev / test
 pytest>=8.2.0
 pytest-mock>=3.14.0
