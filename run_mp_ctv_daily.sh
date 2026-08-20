@@ -6,6 +6,27 @@
 set -e  # exit immediately if any command fails
 
 cd /root/sbo
+
+# Auto-sync with GitHub before running -- avoids a full day's run getting
+# BLOCKED by git_guard.py just because a `git pull` hadn't happened yet
+# between the last GitHub push and this cron firing (git_guard only ever
+# blocks on being behind origin/main; a clean fast-forward here removes
+# that case entirely). Only refuses when the tree is ALSO dirty -- that's
+# the case actually worth stopping for (someone editing the droplet
+# directly), so it's left for manual reconciliation rather than silently
+# pulled over.
+git fetch origin main
+LOCAL_SHA=$(git rev-parse HEAD)
+REMOTE_SHA=$(git rev-parse origin/main)
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "ERROR: droplet is behind origin/main AND has uncommitted local changes -- refusing to auto-pull. Reconcile manually before the next run."
+        exit 1
+    fi
+    echo "Droplet was behind origin/main -- pulling latest before running."
+    git pull origin main
+fi
+
 set -a
 source .env
 set +a

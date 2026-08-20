@@ -12,6 +12,21 @@
 set -e  # exit immediately if any command fails
 
 cd /root/sbo
+
+# Auto-sync with GitHub before running -- see run_mp_ctv_daily.sh for the
+# full rationale (same fix, same underlying git_guard.py exposure).
+git fetch origin main
+LOCAL_SHA=$(git rev-parse HEAD)
+REMOTE_SHA=$(git rev-parse origin/main)
+if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
+    if [ -n "$(git status --porcelain)" ]; then
+        echo "ERROR: droplet is behind origin/main AND has uncommitted local changes -- refusing to auto-pull. Reconcile manually before the next run."
+        exit 1
+    fi
+    echo "Droplet was behind origin/main -- pulling latest before running."
+    git pull origin main
+fi
+
 set -a
 source .env
 set +a
