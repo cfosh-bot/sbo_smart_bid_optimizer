@@ -388,12 +388,22 @@ def _fetch_last_1_day_imps(
     """Per-LI yesterday-impression flag. cols: BW_Line_Item_ID, Had_Impressions_Yesterday, Last_Updated.
 
     Produces every input LI ID (so consumers can detect zero-delivery as 'N').
+
+    2026-08-21: was bid_day: "1 day" -- same rolling-window undercounting bug
+    fixed in _fetch_deal_performance_1day (confirmed there to catch as little
+    as ~2% of true volume when this runs at 6am). Here the consequence is
+    worse than a display bug: pipeline.py's paused-state guard trusts an 'N'
+    here to mean genuinely zero delivery before confirming a line as
+    actively paused. A low-volume but real-delivering line could round down
+    to 'N' under the old filter and get wrongly held in a paused state.
+    Switched to "yesterday" to match the already-correct pattern in
+    sbo/pacing.py.
     """
     rows = bw.fetch_report(
         {
             "view": "performance_agg",
             "fields": ["line_item_id", "impression"],
-            "filters": {"line_item_id": ",".join(li_ids), "bid_day": "1 day"},
+            "filters": {"line_item_id": ",".join(li_ids), "bid_day": "yesterday"},
             "result_format": "csv",
         },
         label="Last 1 Day Imps",
