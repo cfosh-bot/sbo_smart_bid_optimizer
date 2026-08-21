@@ -199,12 +199,29 @@ def _fetch_atr(
 def _fetch_deal_performance_1day(
     bw: BeeswaxClient, bw_ids: List[str], run: RunFolder
 ) -> pd.DataFrame:
-    """Yesterday-only performance_agg report, keyed on line_item_id + deal_id.
+    """Yesterday's performance_agg report, keyed on line_item_id + deal_id.
 
     Same shape as `_fetch_atr` (deal-level, not just the LI-level yes/no flag
-    `_fetch_last_1_day_imps` produces) but scoped to `bid_day: "1 day"` instead
+    `_fetch_last_1_day_imps` produces) but scoped to one settled day instead
     of all-time — gives real per-day impressions/spend for the dashboard's
     actual-clearing-CPM view, without diffing cumulative snapshots.
+
+    2026-08-21: bid_day was "1 day" (a rolling relative window from call
+    time), which massively undercounted delivery when this runs early the
+    next morning -- confirmed empirically: pulling with "1 day" at 6am
+    caught ~2% of a line item's true daily volume, producing a wildly
+    skewed blended CPM. sbo/pacing.py's own real "yesterday impressions"
+    fetch already uses the literal "yesterday" keyword on this same view
+    and is correct in production every day -- switched to match it.
+    Confirmed via a live pull that "yesterday" returns the exact settled
+    total (to the penny) that the platform's own report shows for that
+    calendar day.
+
+    Note the resulting day-labeling: the row this feeds is stamped with
+    the RUN's own date (that morning's bid decision, correctly same-day),
+    while these impressions/spend are for the PRECEDING calendar day --
+    by design, since a day's delivery isn't settled until the next
+    morning. The dashboard excludes "today" for the same reason.
 
     Non-critical: callers should catch and log, not fail the run, on error —
     this feeds dashboard history, not the bid push.
@@ -219,7 +236,7 @@ def _fetch_deal_performance_1day(
             "impression",
             "media_spend_usd",
         ],
-        "filters": {"line_item_id": ",".join(bw_ids), "bid_day": "1 day"},
+        "filters": {"line_item_id": ",".join(bw_ids), "bid_day": "yesterday"},
         "result_format": "csv",
     }
     rows = bw.fetch_report(payload, label="Deal Performance 1-Day", row_cap=30000)
