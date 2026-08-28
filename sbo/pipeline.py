@@ -725,7 +725,7 @@ def run_phase1(ctx: RunContext) -> None:
     # Total Audio / Select CTV: skip Line Item Import refresh — BW LI IDs are
     # pasted directly into Beeswax Line Item Settings. Podcast/Streaming/MP CTV
     # use Line Item Import.
-    if ctx.cfg.tactic in ("total_audio", "select_ctv"):
+    if ctx.cfg.tactic in ("select_ctv",):
         bw_settings = ctx.sheets.read_tab("beeswax_line_item_settings")
     else:
         bw_settings = _refresh_bw_line_item_settings(ctx)

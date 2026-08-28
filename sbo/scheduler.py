@@ -51,8 +51,9 @@ load_dotenv()
 # ── Tuneable constants ────────────────────────────────────────────────────
 
 TACTICS = [
-    ("Podcast",   "sbo/config/podcast.yaml",  "SHEET_ID_PODCAST"),
-    ("Streaming", "sbo/config/streaming.yaml", "SHEET_ID_STREAMING"),
+    ("Podcast",     "sbo/config/podcast.yaml",     "SHEET_ID_PODCAST"),
+    ("Streaming",   "sbo/config/streaming.yaml",   "SHEET_ID_STREAMING"),
+    ("Total_Audio", "sbo/config/total_audio.yaml", "SHEET_ID_TOTAL_AUDIO"),
 ]
 
 MAX_RETRIES     = 2       # retries after first attempt (3 total)
@@ -478,7 +479,7 @@ def workflow_maintenance() -> None:
         log.error("Maintenance job finished WITH failures")
         sys.exit(1)
     else:
-        log.info("Maintenance job complete — Podcast and Streaming OK")
+        log.info("Maintenance job complete — Podcast, Streaming and Total Audio OK")
 
 
 def workflow_new_line() -> None:
@@ -662,7 +663,7 @@ def workflow_full_and_push() -> None:
         )
         sys.exit(1)
     else:
-        log.info("Full+push job complete — Podcast and Streaming OK")
+        log.info("Full+push job complete — Podcast, Streaming and Total Audio OK")
         notify_slack(
             f"✅ SBO nightly Full Run + Push completed successfully "
             f"({date.today().isoformat()}) — Podcast and Streaming both OK."
