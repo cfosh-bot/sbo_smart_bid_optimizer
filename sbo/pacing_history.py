@@ -30,8 +30,8 @@ from typing import Optional
 import duckdb
 import pandas as pd
 
-RUNS_DIR = Path("/root/sbo/runs")
-HISTORY_DIR = Path("/root/sbo/dashboards")
+RUNS_DIR = Path(__file__).resolve().parent.parent / "runs"
+HISTORY_DIR = Path(__file__).resolve().parent.parent / "dashboards"
 LIVE_FILE = HISTORY_DIR / "mp_ctv_pacing_history.csv.gz"
 ARCHIVE_DIR = HISTORY_DIR / "archive"
 
