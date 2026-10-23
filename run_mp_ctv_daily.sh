@@ -5,7 +5,7 @@
 
 set -e  # exit immediately if any command fails
 
-cd /root/sbo
+cd "$(dirname "$0")" || exit 1
 set -a
 source .env
 set +a
@@ -19,7 +19,7 @@ notify_failure() {
     local exit_code=$?
     if [ -n "$SLACK_WEBHOOK_URL" ]; then
         curl -s -X POST -H 'Content-Type: application/json' \
-            --data "{\"text\": \":rotating_light: MP CTV daily run FAILED during '${LAST_STAGE}' (exit ${exit_code}) on $(date -u '+%Y-%m-%d %H:%M UTC'). Check /root/sbo/logs/sbo_mp_ctv.log on the droplet.\"}" \
+            --data "{\"text\": \":rotating_light: MP CTV daily run FAILED during '${LAST_STAGE}' (exit ${exit_code}) on $(date -u '+%Y-%m-%d %H:%M UTC'). Check the MCTV log on $(hostname -s).\"}" \
             "$SLACK_WEBHOOK_URL" >/dev/null 2>&1 || true
     fi
 }
@@ -46,7 +46,7 @@ if [ "$LOCAL_SHA" != "$REMOTE_SHA" ]; then
     git pull origin main
 fi
 
-PYTHON=/root/sbo/.venv/bin/python
+PYTHON="$PWD/.venv/bin/python"
 CONFIG=sbo/config/marketplace_ctv.yaml
 SID="$SHEET_ID_MARKETPLACE_CTV"
 
@@ -60,7 +60,7 @@ LAST_STAGE="pushonly"
 $PYTHON -m sbo.pipeline pushonly --config "$CONFIG" --sheet-id "$SID"
 
 # --- Dashboard history (non-critical: log failure but don't fail the run) ---
-RUN_DIR=$(ls -dt /root/sbo/runs/$(date +%Y-%m-%d)_*_marketplace_ctv_pushonly 2>/dev/null | head -1)
+RUN_DIR=$(ls -dt "$PWD"/runs/$(date +%Y-%m-%d)_*_marketplace_ctv_pushonly 2>/dev/null | head -1)
 if [ -n "$RUN_DIR" ]; then
     $PYTHON -m sbo.pacing_history append --run-dir "$RUN_DIR" || echo "WARNING: pacing_history append failed for $RUN_DIR"
     $PYTHON -m sbo.pacing_history cleanup --keep-days 14 || echo "WARNING: pacing_history cleanup failed"
